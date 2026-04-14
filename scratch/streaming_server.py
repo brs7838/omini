@@ -19,7 +19,8 @@ model = OmniVoice.from_pretrained(
     dtype=torch.float16
 )
 
-REF_AUDIO_PATH = r"C:\Users\pc\Downloads\Ravi Sir.mp3"
+# Voice clone prompt path (included in repo)
+REF_AUDIO_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "voices", "ravi_sir.mp3")
 print(f"Loading reference voice: {REF_AUDIO_PATH}")
 voice_prompt = model.create_voice_clone_prompt(ref_audio=REF_AUDIO_PATH)
 

@@ -26,7 +26,8 @@ SILENCE_DURATION = 1.6
 LLM_URL = "http://127.0.0.1:8080/v1/chat/completions"
 LLM_MODEL = "sarvam" 
 
-REF_AUDIO_PATH = r"C:\Users\pc\Downloads\Ravi Sir.mp3"
+# Voice clone prompt path (included in repo)
+REF_AUDIO_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "voices", "ravi_sir.mp3")
 
 def clean_text(text):
     """Removes metadata, markdown, and artifacts from AI response."""
