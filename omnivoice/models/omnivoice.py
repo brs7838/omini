@@ -362,12 +362,18 @@ class OmniVoice(PreTrainedModel):
         # Result: Layer 0 ID Layer 1 ID + Layer 2 ID + 2050...
         shifted_ids = (
             input_ids * audio_mask.unsqueeze(1)
-        ) + self.codebook_layer_offsets.view(1, -1, 1)
+        ) + self.codebook_layer_offsets.view(1, -1, 1).to(input_ids.device)
 
         # input: [Batch, 8, Seq] -> output: [Batch, Seq, Hidden]
         audio_embeds = self.audio_embeddings(shifted_ids).sum(dim=1)
 
-        return torch.where(audio_mask.unsqueeze(-1), audio_embeds, text_embeds)
+        # Ensure text_embeds is on the same device as audio_mask and audio_embeds
+        device = audio_mask.device
+        return torch.where(
+            audio_mask.unsqueeze(-1).to(device), 
+            audio_embeds.to(device), 
+            text_embeds.to(device)
+        )
 
     def forward(
         self,
@@ -1258,7 +1264,7 @@ class OmniVoice(PreTrainedModel):
                     c_logits, u_logits, gen_config
                 )
 
-                scores = scores - (layer_ids * gen_config.layer_penalty_factor)
+                scores = scores - (layer_ids.to(scores.device) * gen_config.layer_penalty_factor)
 
                 if gen_config.position_temperature > 0.0:
                     scores = _gumbel_sample(scores, gen_config.position_temperature)
