@@ -312,6 +312,7 @@ class OmniVoice(PreTrainedModel):
     def transcribe(
         self,
         audio: Union[str, tuple],
+        **kwargs,
     ) -> str:
         """Transcribe audio using the loaded Whisper ASR model.
 
@@ -319,6 +320,8 @@ class OmniVoice(PreTrainedModel):
             audio: File path or ``(waveform, sample_rate)`` tuple.
                 Waveform can be a numpy array or torch.Tensor of shape
                 ``(1, T)`` or ``(T,)``.
+            **kwargs: Additional keyword arguments passed to the pipeline.
+                e.g., return_timestamps=True for long audio.
 
         Returns:
             Transcribed text.
@@ -329,7 +332,7 @@ class OmniVoice(PreTrainedModel):
             )
 
         if isinstance(audio, str):
-            return self._asr_pipe(audio)["text"].strip()
+            return self._asr_pipe(audio, **kwargs)["text"].strip()
         else:
             waveform, sr = audio
             if isinstance(waveform, torch.Tensor):
@@ -339,7 +342,7 @@ class OmniVoice(PreTrainedModel):
                 "array": waveform,
                 "sampling_rate": sr,
             }
-            return self._asr_pipe(audio_input)["text"].strip()
+            return self._asr_pipe(audio_input, **kwargs)["text"].strip()
 
     def get_input_embeddings(self):
         return self.llm.get_input_embeddings()

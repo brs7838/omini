@@ -10,6 +10,8 @@ import threading
 import queue
 import re
 import sys
+import io
+from faster_whisper import WhisperModel
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.utils.text import chunk_text_punctuation
 from audio_utils import to_8k  # Local utility
@@ -19,12 +21,13 @@ CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000 
-SILENCE_THRESHOLD = 1200 
-SILENCE_DURATION = 1.6  
+SILENCE_THRESHOLD = 800  # More sensitive
+SILENCE_DURATION = 0.8   # Snappier turn-taking
+MAX_BUFFER_SECONDS = 15  # Prevent 30s crash
 
-# llama.cpp Server Config
-LLM_URL = "http://127.0.0.1:8080/v1/chat/completions"
-LLM_MODEL = "sarvam" 
+# Ollama Server Config (OpenAI Compatible)
+LLM_URL = "http://127.0.0.1:11434/v1/chat/completions"
+LLM_MODEL = "gemma3:4b" 
 
 # Voice clone prompt path (included in repo)
 REF_AUDIO_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "voices", "ravi_sir.mp3")
@@ -48,16 +51,14 @@ class VoiceAssistant:
             load_asr=False # We will load ASR manually on GPU 1
         )
         
-        print("Loading Whisper ASR on GPU 1 (GTX 1650)...")
-        from transformers import pipeline as hf_pipeline
-        self.asr_pipe = hf_pipeline(
-            "automatic-speech-recognition",
-            model="openai/whisper-large-v3-turbo",
-            dtype=torch.float16,
-            device="cuda:1", # Secondary GPU
+        print("Loading Whisper ASR (Faster) on GPU 1 (GTX 1650)...")
+        # Using faster-whisper for near-instant transcription
+        self.asr_model = WhisperModel(
+            "large-v3-turbo", 
+            device="cuda", 
+            device_index=1, 
+            compute_type="int8_float16" # Fast and memory efficient for GTX 1650
         )
-        # Inject into model for internal use if needed
-        self.model._asr_pipe = self.asr_pipe
         
         print(f"Creating voice clone prompt from: {REF_AUDIO_PATH}")
         try:
@@ -174,6 +175,15 @@ class VoiceAssistant:
                     if has_spoken:
                         silent_chunks += 1
                 
+                # Prevent indefinitely growing buffer (30s error fix)
+                if len(frames) > (MAX_BUFFER_SECONDS * RATE / CHUNK):
+                    if not has_spoken:
+                        frames = frames[-(CHUNK * 2):] # Keep only last 2 chunks
+                    else:
+                        # Force process if it's too long
+                        print("Auto-processing long segment...")
+                        silent_chunks = 100 
+                
                 if has_spoken and silent_chunks > (SILENCE_DURATION * RATE / CHUNK):
                     self.is_processing = True 
                     print("Processing...      ")
@@ -189,18 +199,28 @@ class VoiceAssistant:
                 time.sleep(0.1)
 
     def process_interaction(self, audio_bytes):
-        audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        audio_input = {"array": np.squeeze(audio_np), "sampling_rate": RATE}
+        # Convert audio bytes to float32 numpy array for faster-whisper
+        audio_fp32 = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         
         try:
-            res = self.model._asr_pipe(audio_input, generate_kwargs={"language": "hindi", "task": "transcribe"})
-            text = res["text"].strip()
+            # Transcribe with faster-whisper
+            segments, info = self.asr_model.transcribe(
+                audio_fp32, 
+                beam_size=1, # Fast!
+                language=None, # Auto-detect for Hinglish
+                vad_filter=True
+            )
+            text = "".join([s.text for s in segments]).strip()
+            
+            if text:
+                print(f"Whisper heard: '{text}' (lang: {info.language})")
         except Exception as e:
             print(f"ASR Error: {e}")
             self.is_processing = False
             return
-
-        if not text or len(text) < 2:
+        
+        # Filter out junk and noise artifacts like "???", "...", etc.
+        if not text or len(text) < 2 or re.match(r'^[\?\.\s!-]+$', text):
             self.is_processing = False
             return
         
