@@ -28,3 +28,18 @@ examples/exp*/
 .claude/
 *.wav
 *.jsonl
+
+# Runtime / scratch artifacts (do NOT commit)
+*.log
+session_trace.log
+backend.log
+calls_history.json
+scratch_*.py
+/scratch/
+web_backend/scratch/
+web_backend/__pycache__/
+
+# User-uploaded voice library (personal data; ravi_sir.mp3 stays tracked)
+assets/voices/*.mp3.mpeg
+assets/voices/voices.json
+assets/voices/cabddfdd_audio.mp3
