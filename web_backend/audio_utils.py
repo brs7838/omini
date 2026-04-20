@@ -24,3 +24,20 @@ def trim_audio_file(file_path, duration_sec=10):
         print(f"[Audio] Trimming failed: {e}")
         # If pydub fails (maybe missing ffmpeg), just return original and hope for the best
         return file_path
+
+def to_8k(audio, orig_sr=24000, device="cpu"):
+    """Fast resampling to 8kHz using scipy. Keep it simple and stable."""
+    import numpy as np
+    from scipy import signal
+    
+    if orig_sr == 8000:
+        return audio
+        
+    # Standard 24k -> 8k is a simple 3:1 decimation
+    if orig_sr == 24000:
+        return signal.decimate(audio, 3).astype(np.float32)
+    
+    # Generic resample for other rates
+    ratio = 8000 / orig_sr
+    num_samples = int(len(audio) * ratio)
+    return signal.resample(audio, num_samples).astype(np.float32)

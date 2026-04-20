@@ -10,22 +10,71 @@ import queue
 import re
 from faster_whisper import WhisperModel
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
-from audio_utils import to_8k
+# Resolve imports from web_backend
+import sys
+import os
+ROOT_DIR = r"e:\Ai\Omini with Astrisk\Omini"
+BACKEND_DIR = os.path.join(ROOT_DIR, "web_backend")
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
+
+try:
+    from web_backend.audio_utils import to_8k
+except ImportError:
+    from audio_utils import to_8k
 
 # --- Configuration ---
 RATE = 16000
 CHUNK = 1024
-SILENCE_THRESHOLD = 1200    # Increased to prevent self-triggering
-SILENCE_DURATION = 0.7     # Lowered for Gemini-style speed
-MIN_SPEECH_DURATION = 0.4
-MAX_RECORD_DURATION = 10.0
+SILENCE_THRESHOLD = 700     # Lowered: catches softer speech onset
+SILENCE_DURATION = 0.8      # Slightly longer to avoid cutting mid-sentence pauses
+MIN_SPEECH_DURATION = 0.3
+MAX_RECORD_DURATION = 15.0
 MIC_INDEX = 1
+PRE_ROLL_CHUNKS = 8         # ~0.5s of pre-speech audio kept (so first syllable isn't lost)
+
+# Hindi context prompt — biases Whisper toward natural Hindi vocabulary.
+# A long, varied Hindi prompt is one of the strongest accuracy levers for
+# faster-whisper on Indian languages. Keep it diverse (greetings, verbs, nouns,
+# question words) so the language model "warms up" to Hindi script + grammar.
+ASR_INITIAL_PROMPT = (
+    "नमस्ते, आप कैसे हैं? मैं बिल्कुल ठीक हूँ, बहुत-बहुत धन्यवाद। "
+    "कृपया मुझे बताइए, आज का मौसम कैसा है? "
+    "हाँ, नहीं, ठीक है, अच्छा, सही, गलत, माफ़ कीजिए, शुक्रिया। "
+    "क्या आप मेरी मदद कर सकते हैं? मुझे यह समझ नहीं आया, फिर से बोलिए। "
+    "मेरा नाम, आपका नाम, घर, परिवार, दोस्त, स्कूल, काम, समय, पैसा, "
+    "खाना, पानी, चाय, किताब, फ़ोन, गाड़ी, शहर, गाँव, देश, भारत। "
+    "एक, दो, तीन, चार, पाँच, छह, सात, आठ, नौ, दस। "
+    "आज, कल, अभी, बाद में, सुबह, शाम, रात, दिन।"
+)
 
 LLM_URL = "http://127.0.0.1:11434/v1/chat/completions"
 LLM_MODEL = "gemma3:4b"
 
 # Voice cloning setup
 REF_AUDIO_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "voices", "ravi_sir_8s.wav")
+
+def preprocess_for_asr(audio_np, sr=16000):
+    """Light DSP cleanup that consistently improves Whisper accuracy on noisy mics:
+       1) DC-offset removal (removes mic bias),
+       2) Pre-emphasis (boosts high freqs → sharper Hindi consonants like क/ख/त/थ),
+       3) Peak normalisation (gives quiet speech full dynamic range),
+       4) 0.4s silence padding at both ends (Whisper is trained on padded chunks).
+    """
+    if audio_np.size == 0:
+        return audio_np
+    # 1) DC offset
+    audio_np = audio_np - float(np.mean(audio_np))
+    # 2) Pre-emphasis
+    audio_np = np.append(audio_np[0], audio_np[1:] - 0.97 * audio_np[:-1]).astype(np.float32)
+    # 3) Peak normalise
+    peak = float(np.max(np.abs(audio_np)))
+    if peak > 1e-4:
+        audio_np = audio_np * (0.97 / peak)
+    # 4) Silence padding
+    pad = np.zeros(int(0.4 * sr), dtype=np.float32)
+    return np.concatenate([pad, audio_np.astype(np.float32), pad])
+
 
 def clean_text(text):
     """Removes metadata, markdown, and objects in brackets from AI response."""
@@ -42,13 +91,25 @@ class FastVoiceAssistant:
         
         # GPU Setup
         # Whisper: GPU 1 (GTX 1650), OmniVoice: GPU 0 (RTX 3060)
-        print("Loading Whisper (Turbo) on GPU 1...")
-        self.asr_model = WhisperModel(
-            "turbo", 
-            device="cuda", 
-            device_index=1, 
-            compute_type="float16"
-        )
+        print("Loading Whisper (large-v3) on GPU 1 for accurate Hindi ASR...")
+        # large-v3 is significantly more accurate for Hindi than turbo.
+        # If VRAM is tight, fall back to "turbo" — but turbo drops Hindi accuracy noticeably.
+        try:
+            self.asr_model = WhisperModel(
+                "large-v3",
+                device="cuda",
+                device_index=1,
+                compute_type="float16"
+            )
+            print("Loaded large-v3 (best Hindi accuracy).")
+        except Exception as e:
+            print(f"large-v3 load failed ({e}); falling back to turbo.")
+            self.asr_model = WhisperModel(
+                "turbo",
+                device="cuda",
+                device_index=1,
+                compute_type="float16"
+            )
         
         print("Loading OmniVoice TTS on GPU 0...")
         self.tts_model = OmniVoice.from_pretrained(
@@ -64,7 +125,7 @@ class FastVoiceAssistant:
             self.voice_prompt = self.tts_model.create_voice_clone_prompt(
                 ref_audio=REF_AUDIO_PATH,
                 ref_text="नमस्ते, मैं OmniVoice हूँ।",
-                preprocess_prompt=False
+                preprocess_prompt=True # [Phase 17] Filters noise for clearer cloning
             )
             print("Voice prompt created successfully!")
         except Exception as e:
@@ -99,24 +160,30 @@ class FastVoiceAssistant:
         print("\n[System] Ready. Talk to me!")
         
         frames = []
+        pre_roll = []   # rolling buffer of recent silent chunks (kept so we don't clip the first phoneme)
         silent_chunks = 0
         speech_chunks = 0
         has_spoken = False
-        
+
         while self.is_running:
-            # If the user starts talking while we are playing, STOP playback.
-            # (Crude interruption support)
             try:
                 data = in_stream.read(CHUNK, exception_on_overflow=False)
                 audio_data = np.frombuffer(data, dtype=np.int16)
-                energy = np.abs(audio_data).mean()
-                
+                # RMS is more robust than mean(abs) — better matches actual loudness
+                energy = float(np.sqrt(np.mean(audio_data.astype(np.float32) ** 2)))
+
                 if energy > SILENCE_THRESHOLD:
                     if self.is_speaking:
                         print("\n[Interrupted!]")
                         self.abort_playback = True
                         self.clear_queues()
-                    
+
+                    if not has_spoken:
+                        # First voiced chunk — prepend pre-roll so the onset isn't lost
+                        frames.extend(pre_roll)
+                        self.live_audio_buffer.extend(pre_roll)
+                        pre_roll = []
+
                     silent_chunks = 0
                     speech_chunks += 1
                     has_spoken = True
@@ -126,6 +193,11 @@ class FastVoiceAssistant:
                     if has_spoken:
                         silent_chunks += 1
                         frames.append(data)
+                    else:
+                        # Maintain rolling pre-roll buffer of recent silent chunks
+                        pre_roll.append(data)
+                        if len(pre_roll) > PRE_ROLL_CHUNKS:
+                            pre_roll.pop(0)
                 
                 # Check for processing trigger
                 if has_spoken and silent_chunks > (SILENCE_DURATION * RATE / CHUNK):
@@ -149,41 +221,53 @@ class FastVoiceAssistant:
             try:
                 audio_bytes = self.audio_queue.get(timeout=0.1)
                 audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                
+
+                # DSP preprocessing — biggest accuracy win on noisy / low-gain mics
+                audio_np = preprocess_for_asr(audio_np, sr=RATE)
+
                 t0 = time.time()
-                # Final transcription for the LLM
-                segments, _ = self.asr_model.transcribe(audio_np, language="hi")
-                text = " ".join([seg.text for seg in segments]).strip()
-                
+                # Accuracy-tuned transcription.
+                # NOTE: Silero `vad_filter` is intentionally OFF — for Hindi it sometimes
+                # trims real speech (especially soft vowels), and we already gate audio
+                # on the mic side. Turning it off improved word-recovery noticeably.
+                segments, info = self.asr_model.transcribe(
+                    audio_np,
+                    language="hi",
+                    task="transcribe",
+                    beam_size=8,                      # bigger beam → better Hindi hypotheses
+                    best_of=8,
+                    patience=1.5,
+                    temperature=[0.0, 0.2, 0.4, 0.6], # fallback temps reduce hallucination loops
+                    condition_on_previous_text=False, # avoids context bleed across utterances
+                    initial_prompt=ASR_INITIAL_PROMPT,
+                    vad_filter=False,
+                    no_speech_threshold=0.45,
+                    compression_ratio_threshold=2.4,
+                    log_prob_threshold=-1.0,
+                    word_timestamps=False,
+                    suppress_blank=True,
+                )
+                text = " ".join(seg.text for seg in segments).strip()
+                # Drop common Whisper Hindi-mode hallucinations on near-silence
+                if text in {"शुक्रिया।", "धन्यवाद।", "नमस्ते।", "सुनो।", "हाँ।"} and len(audio_bytes) < RATE * 2 * 1:
+                    text = ""
+                dt = time.time() - t0
+
                 if text:
-                    print(f"\rYou: {text} (Final)                ")
+                    print(f"\rYou: {text}   (ASR {dt:.2f}s)                ")
                     self.text_queue.put(text)
                 else:
                     print("\r[System] (No speech detected)          ")
             except queue.Empty:
                 continue
+            except Exception as e:
+                print(f"\nASR error: {e}")
 
     def live_asr_worker(self):
-        """Thread: Provides partial transcription while the user is still speaking."""
-        while self.is_running:
-            if len(self.live_audio_buffer) > 10 and not self.is_processing:
-                # Take current buffer snapshot
-                snapshot = b"".join(list(self.live_audio_buffer))
-                audio_np = np.frombuffer(snapshot, dtype=np.int16).astype(np.float32) / 32768.0
-                
-                try:
-                    # Run a very fast partial transcription
-                    segments, _ = self.asr_model.transcribe(
-                        audio_np, 
-                        language="hi",
-                        beam_size=1  # Lowest beam for max speed during live preview
-                    )
-                    partial_text = " ".join([seg.text for seg in segments]).strip()
-                    if partial_text:
-                        print(f"\rYou: {partial_text}...", end="", flush=True)
-                except:
-                    pass
-            time.sleep(0.4) # Update every 400ms
+        """Disabled: live partial transcription competes with the final ASR pass on the
+        same GPU and noticeably degrades final accuracy. Re-enable only on a second
+        Whisper instance / GPU if needed."""
+        return
 
     def llm_tts_worker(self):
         """Thread: Calls LLM and streams sentences to TTS."""
@@ -248,10 +332,19 @@ class FastVoiceAssistant:
                 text=text, 
                 language="hi", 
                 voice_clone_prompt=self.voice_prompt,
-                generation_config=OmniVoiceGenerationConfig(num_step=12)
+                generation_config=OmniVoiceGenerationConfig(
+                    num_step=12
+                )
             )
             audio_24k = audio_list[0]
             
+            # --- PureVoice Normalization (Phase 17) ---
+            # Keeps the audio crisp and prevents "heavy" distortion
+            peak = np.max(np.abs(audio_24k)) if len(audio_24k) > 0 else 0
+            if peak > 1.0 or peak < 0.7:
+                scale = 0.95 / max(peak, 1e-4)
+                audio_24k = audio_24k * scale
+
             # Resample on GPU for near-zero delay
             audio_8k = to_8k(audio_24k, orig_sr=24000, device="cuda:0")
             pcm_data = (audio_8k * 32767).astype(np.int16).tobytes()

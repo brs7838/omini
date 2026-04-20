@@ -12,7 +12,13 @@ interface CallRecord {
   type: string;
 }
 
-export default function CallHistory({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) {
+interface CallHistoryProps {
+  isOpen: boolean;
+  onClose: () => void;
+  activeVoiceId: string;
+}
+
+export default function CallHistory({ isOpen, onClose, activeVoiceId }: CallHistoryProps) {
   const [history, setHistory] = useState<CallRecord[]>([]);
   const [dialingPhone, setDialingPhone] = useState<string | null>(null);
 
@@ -35,7 +41,8 @@ export default function CallHistory({ isOpen, onClose }: { isOpen: boolean; onCl
       const resp = await fetch("http://127.0.0.1:8000/calls/dial", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone_number: phone, voice_id: "ravi" }),
+        // Use the currently selected voice for redials (was hardcoded "ravi").
+        body: JSON.stringify({ phone_number: phone, voice_id: activeVoiceId }),
       });
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({ detail: "Dial failed" }));

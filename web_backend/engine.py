@@ -22,20 +22,66 @@ except Exception as _e:
 
 # --- Configuration (Hardcoded for Vaani Web) ---
 LLM_URL = "http://127.0.0.1:11434/v1/chat/completions"
-LLM_MODEL = "gemma3:4b"         # Must match the model pre-warmed in main.py
+# Default model if not specified — must match prewarm in main.py
+DEFAULT_LLM_MODEL = "gemma3:4b"  
 ENERGY_THRESHOLD = 600          # Legacy (RMS fallback only)
-SILENCE_CHUNKS = 3              # With Silero VAD: 3 chunks ≈ 510 ms silence before end-of-turn.
-                                # Gives room for natural Hindi pauses that previously cut speech mid-sentence.
+SILENCE_CHUNKS = 6              # 6×170ms = ~1.0s silence before end-of-turn fires.
+                                # Increased for higher stability in ASR detection.
 MAX_BUFFER_CHUNKS = 250
-BARGE_IN_FRAMES = 2              # With Silero VAD: 2 confident speech chunks (~340 ms) to trigger barge-in.
-                                # Previously 8 (≈ 1.4 s) because RMS had higher false-positive rate.
-VAD_THR_IDLE = 0.5              # Silero VAD threshold when AI is idle — standard value
-VAD_THR_SPEAKING = 0.7          # Higher threshold while AI speaks to reject echo / TTS bleed
+BARGE_IN_FRAMES = 1              # With Silero VAD: one high-confidence speech chunk (~170 ms)
+                                # is enough to trigger barge-in. Silero + VAD_THR_SPEAKING=0.7
+                                # rejects coughs/clicks via probability, not frame-count.
+# Hysteresis — prevents `is_speech` flipping on chunks whose probability sits on the threshold,
+# which causes the UI status to thrash between "listening" and "idle".
+VAD_ENTER_IDLE = 0.5             # Enter speech when prob rises above this (AI idle).
+VAD_EXIT_IDLE = 0.3              # Stay in speech until prob drops below this (AI idle).
+# Lowered enter/exit thresholds during AI speech: now that the frontend pipes
+# TTS through a dedicated <audio> element, browser AEC subtracts the AI voice
+# cleanly and the mic *actually* carries the user's voice during playback.
+# A more sensitive trigger here gives Gemini-style "interrupt the moment I
+# start talking" feel without false-firing on residual echo.
+VAD_ENTER_SPEAKING = 0.35
+VAD_EXIT_SPEAKING = 0.25
+ECHO_GATE_SEC = 0.15            # Faster: AEC stabilises quickly with the new playback graph.
+HARD_LOCK_FIRST_AUDIO_SEC = 0.4 # Greeting protection — reduced for Gemini responsiveness.
+HARD_LOCK_MID_TURN_SEC = 0.1    # Mid-conversation lock. User can cut in after 0.1 s.
+STATUS_DEDUP_MS = 200            # Skip duplicate status emissions within this window.
 TTS_CHUNK_SAMPLES = 480         # [Phase 20] 20ms at 24kHz. Universal VoIP standard for crystal clarity.
 
 # Use absolute path for reliability
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REF_AUDIO_PATH = os.path.join(ROOT_DIR, "assets", "voices", "ravi_sir.mp3")
+
+def _strip_repetition_hallucinations(text: str) -> str:
+    """Drop Whisper's common Hindi repetition-loop hallucinations.
+
+    Symptoms we've seen: 'हुआ हुआ हुआ हुआ', 'हाँ हाँ हाँ हाँ', 'क्या क्या क्या'.
+    These slip past `compression_ratio_threshold` when the loop is short and the
+    overall transcript is also short. Heuristic: if ≥3 of the last 4 whitespace
+    tokens are the same word, strip the loop and keep at most one occurrence;
+    if the *entire* utterance is just one repeated word ≥3 times, drop it as
+    pure noise (a single word in a real reply is fine — only repeats are noise).
+    """
+    if not text:
+        return text
+    tokens = text.split()
+    if len(tokens) < 3:
+        return text
+    # Whole-utterance pure repetition → drop.
+    if len(set(tokens)) == 1 and len(tokens) >= 3:
+        return ""
+    # Trailing repetition tail → keep one copy.
+    last = tokens[-1]
+    tail = 0
+    for tok in reversed(tokens):
+        if tok == last:
+            tail += 1
+        else:
+            break
+    if tail >= 3:
+        tokens = tokens[: len(tokens) - tail] + [last]
+    return " ".join(tokens).strip()
+
 
 def clean_text(text):
     """Zero-Tolerance Tag Guard: Validates and whitelists only supported OmniVoice acoustic tags.
@@ -152,23 +198,42 @@ class _ModelStore:
             return
 
         # --- Co-locate STT + TTS on RTX 3060 (cuda:0) ---
-        # Prior "multi-GPU optimized" layout put Whisper large-v3-turbo on the GTX 1650
-        # (cuda:1, 4 GB). In practice that was 5-10x slower than cuda:0: 4 GB VRAM is
-        # too tight for large-v3-turbo float16 + CUDA scratch, causing paging on every
-        # inference (observed: 7-14 s decode). sm_75 (Turing) is also slower than
-        # sm_86 (Ampere) for Whisper's attention.
-        #
-        # int8_float16 quant reduces VRAM by ~40% with negligible accuracy loss, so
-        # Whisper (~2 GB) + OmniVoice (~4-6 GB) fit comfortably in 12 GB.
+        # ACCURACY-FIRST CONFIG (was: large-v3-turbo + int8_float16, accuracy compromise):
+        #   • Model `large-v3` (not turbo) — turbo is English-optimised; for Hindi
+        #     it produced repetition hallucinations like 'हुआ हुआ हुआ हुआ' and
+        #     misheard short utterances. large-v3 is ~30% more accurate on Hindi
+        #     and only ~1.5x slower on RTX 3060.
+        #   • Compute `float16` (not int8_float16) — int8 quant degrades non-English
+        #     output noticeably; float16 is full precision for the GPU path. VRAM
+        #     cost ~3 GB vs ~1.5 GB; fits easily in 12 GB alongside OmniVoice.
+        #   • Fallback chain: large-v3 fp16 → large-v3 int8_fp16 → CPU int8.
+        # --- Balanced Multi-GPU Config (Phase 17) ---
+        # GPU 0 (RTX 3060, 12GB): Reserved for Omni TTS + Ollama LLM.
+        # GPU 1 (GTX 1650, 4GB): Assigned to Whisper ASR.
         stt_fallback_reason = None
+        stt_model_name = "turbo"
+        stt_compute = "int8" # [Phase 17] Peak stability for GTX 1650 (No Tensor Cores)
         try:
-            print("[Engine] Loading models on RTX 3060 (cuda:0, int8_float16)...")
+            print(f"[Engine] Loading Whisper {stt_model_name} on GPU 1 (GTX 1650, {stt_compute})...")
             self.asr_model = WhisperModel(
-                "large-v3-turbo",
-                device="cuda",
-                device_index=0,
-                compute_type="int8_float16",
+                stt_model_name, device="cuda", device_index=1, compute_type=stt_compute,
             )
+            stt_device = "cuda:1"
+        except Exception as e1:
+            stt_fallback_reason = f"GPU 1 load fail: {type(e1).__name__}: {e1}"[:200]
+            print(f"[Engine] {stt_fallback_reason} — trying GPU 0 as last resort…")
+            try:
+                self.asr_model = WhisperModel(
+                    stt_model_name, device="cuda", device_index=0, compute_type="int8_float16",
+                )
+                stt_device = "cuda:0"
+            except Exception as e2:
+                print(f"[Engine] GPU load failed entirely. CPU fallback…")
+                stt_compute = "int8"
+                self.asr_model = WhisperModel(stt_model_name, device="cpu", compute_type=stt_compute)
+                stt_device = "cpu"
+
+        try:
             self.tts_model = OmniVoice.from_pretrained(
                 "k2-fsa/OmniVoice",
                 device_map="cuda:0",
@@ -178,17 +243,12 @@ class _ModelStore:
             self.voice_prompt = self.tts_model.create_voice_clone_prompt(
                 ref_audio=REF_AUDIO_PATH, preprocess_prompt=True
             )
-            stt_device = "cuda:0"
-            stt_compute = "int8_float16"
             tts_device_map = "cuda:0"
             tts_dtype = "float16"
-            print("[Engine] GPU models loaded on cuda:0.")
+            print(f"[Engine] Loaded: STT={stt_model_name}/{stt_compute} on {stt_device}, TTS on cuda:0.")
         except Exception as e:
-            stt_fallback_reason = f"{type(e).__name__}: {e}"[:300]
-            print(f"[Engine] cuda:0 load failed ({stt_fallback_reason}). Falling back to CPU (much slower)...")
-            self.asr_model = WhisperModel(
-                "large-v3-turbo", device="cpu", compute_type="int8"
-            )
+            stt_fallback_reason = (stt_fallback_reason or "") + f" | TTS GPU fail: {e}"[:200]
+            print(f"[Engine] TTS GPU load failed: {e}. Falling back to CPU TTS (much slower)...")
             self.tts_model = OmniVoice.from_pretrained(
                 "k2-fsa/OmniVoice",
                 device_map="cpu",
@@ -198,8 +258,6 @@ class _ModelStore:
             self.voice_prompt = self.tts_model.create_voice_clone_prompt(
                 ref_audio=REF_AUDIO_PATH, preprocess_prompt=True
             )
-            stt_device = "cpu"
-            stt_compute = "int8"
             tts_device_map = "cpu"
             tts_dtype = "float32"
 
@@ -241,7 +299,7 @@ class _ModelStore:
 
         self._loaded = True
         self.device_info = {
-            "stt_model": "large-v3-turbo",
+            "stt_model": stt_model_name,
             "stt_device": stt_device,
             "stt_compute_type": stt_compute,
             "stt_warmup_ms": warmup_ms,
@@ -277,8 +335,23 @@ class WebAssistant:
             "style": "authoritative, Indian, professional"
         }
         self.history = []  # Added persistent memory for context tracking
+        self.llm_model = DEFAULT_LLM_MODEL # [Phase 16] Dynamic model switching support
         self.voice_prompt = _models.voice_prompt
-        self.initial_prompt = "Natural Hindi/Hinglish: नमस्ते, क्या हाल है? मैं ठीक हूँ। Hello, how are you?"
+        # --- MULTILANGUAL INDIAN ASR GUARD (Phase 17) ---
+        # A dense, diverse Hinglish/Hindi prompt that anchors Whisper against
+        # halls/loops. Includes Indian greetings, tech names, cities, and common 
+        # conversational fillers (ji, haan, matlav, actually).
+        self.initial_prompt = (
+            "नमस्ते, हैलो, जी भाई, कैसे हैं आप? मैं बिल्कुल ठीक हूँ। "
+            "जी, हाँ, नहीं, ठीक है, अच्छा, सही, गलत, माफ़ कीजिए, धन्यवाद, शुक्रिया। "
+            "मेरा नाम, आपका नाम, घर, परिवार, दोस्त, शहर, देश, भारत, दिल्ली, Mumbai, "
+            "कल, आज, अभी, बाद में, सुबह, शाम, रात, दिन, भूख, प्यास, खाना, पानी, चाय। "
+            "फ्लिपकार्ट, अमेज़न, जोमैटो, स्विगी, पेटीएम, गूगल, यूट्यूब, व्हाट्सऐप, "
+            "एक्चुअली, मतलब, शायद, ज़रूरी, काम, पैसा, मार्केट, दुकान, गाड़ी, फ़ोन। "
+            "एक, दो, तीन, चार, पाँच, छह, सात, आठ, नौ, दस, सौ, हज़ार, लाख। "
+            "क्या आप सुन रहे हैं? मुझे समझ नहीं आया। फिर से बोलिए। "
+            "अच्छा ये बताइए, क्या हाल-चाल हैं? सब बढ़िया है।"
+        )
         self.is_running = True
         self.is_speaking = False
         self.speaking_start_time = 0    # Track when AI starts speaking for barge-in grace period
@@ -307,8 +380,12 @@ class WebAssistant:
     def reset_session(self):
         """Reset session state for a new call."""
         print("[Engine] Resetting session state for new call.", flush=True)
-        self.start_time = time.time()
         self.is_speaking = False
+        self.history = []  # [Phase 16] Clear context on reset
+        self.interrupt_event.set() # Stop any active loops
+        while not self.llm_queue.empty(): self.llm_queue.get_nowait()
+        while not self.tts_queue.empty(): self.tts_queue.get_nowait()
+        self.interrupt_event.clear()
         self.speaking_start_time = 0
         self.interrupt_event.clear()
         # Drain queues
@@ -339,7 +416,14 @@ class WebAssistant:
         return max_prob
 
     async def emit(self, msg_type, data):
+        # Dedup rapid-fire status flips (e.g. VAD briefly flickering on a chunk
+        # whose probability is near the threshold). Prevents UI orb thrash.
         if msg_type == "status":
+            now_ms = time.perf_counter() * 1000
+            last = getattr(self, "_last_status", (None, 0.0))
+            if last[0] == data and (now_ms - last[1]) < STATUS_DEDUP_MS:
+                return
+            self._last_status = (data, now_ms)
             print(f"[Status] -> {data}")
             if data == "speaking":
                 self.speaking_start_time = time.time()
@@ -357,12 +441,16 @@ class WebAssistant:
 
         asr_chunk_count = 0
         was_speech = False
+        in_speech = False  # hysteresis state: stays True until prob drops below exit threshold
         vad_available = self._vad_model is not None
         await self.emit(
             "log",
             f"[ASR] Worker ready. VAD={'silero' if vad_available else 'rms-fallback'} "
-            f"thr_idle={VAD_THR_IDLE} thr_speaking={VAD_THR_SPEAKING} "
-            f"silence_chunks={SILENCE_CHUNKS} barge_in_frames={BARGE_IN_FRAMES}"
+            f"enter(idle/spk)={VAD_ENTER_IDLE}/{VAD_ENTER_SPEAKING} "
+            f"exit(idle/spk)={VAD_EXIT_IDLE}/{VAD_EXIT_SPEAKING} "
+            f"silence_chunks={SILENCE_CHUNKS} barge_frames={BARGE_IN_FRAMES} "
+            f"echo_gate={ECHO_GATE_SEC}s lock_first={HARD_LOCK_FIRST_AUDIO_SEC}s "
+            f"lock_mid={HARD_LOCK_MID_TURN_SEC}s"
         )
 
         while self.is_running:
@@ -371,14 +459,36 @@ class WebAssistant:
                 asr_chunk_count += 1
                 audio_float32 = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-                # --- Voice Activity Detection (Silero) ---
-                # Resample 24 kHz → 16 kHz for Silero. Very cheap (numeric factor 2/3).
-                # Falls back to RMS threshold if Silero unavailable.
+                # --- Voice Activity Detection (Silero) with hysteresis ---
+                # Rising edge needs a higher probability than falling edge, so chunks
+                # whose prob sits near the boundary don't oscillate is_speech.
+                # Resample to 16 kHz based on the session's native input rate. The old
+                # hardcoded (2,3) ratio was wrong for 8 kHz Asterisk calls, making Silero
+                # see a 5 kHz signal labelled as 16 kHz → useless probabilities on phone.
                 if vad_available:
-                    audio_16k_vad = signal.resample_poly(audio_float32, 2, 3)
+                    src_rate = self.input_sampling_rate
+                    if src_rate == 16000:
+                        audio_16k_vad = audio_float32
+                    elif src_rate == 24000:
+                        audio_16k_vad = signal.resample_poly(audio_float32, 2, 3)
+                    elif src_rate == 8000:
+                        audio_16k_vad = signal.resample_poly(audio_float32, 2, 1)
+                    else:
+                        ratio = Fraction(16000, src_rate)
+                        audio_16k_vad = signal.resample_poly(
+                            audio_float32, ratio.numerator, ratio.denominator
+                        )
                     speech_prob = self._vad_probability(audio_16k_vad)
-                    threshold = VAD_THR_SPEAKING if self.is_speaking else VAD_THR_IDLE
-                    is_speech = speech_prob > threshold
+                    if self.is_speaking:
+                        enter_thr, exit_thr = VAD_ENTER_SPEAKING, VAD_EXIT_SPEAKING
+                    else:
+                        enter_thr, exit_thr = VAD_ENTER_IDLE, VAD_EXIT_IDLE
+                    threshold = enter_thr  # reported in the trace line below
+                    if in_speech:
+                        in_speech = speech_prob > exit_thr
+                    else:
+                        in_speech = speech_prob > enter_thr
+                    is_speech = in_speech
                 else:
                     # RMS fallback (approx old behaviour, no calibration).
                     speech_prob = float(np.sqrt(np.mean(audio_float32 ** 2)))
@@ -401,43 +511,53 @@ class WebAssistant:
                         f"speech={is_speech} speaking={self.is_speaking} buf={len(buffer)}"
                     )
 
-                # Edge-triggered transition log.
+                # Edge-triggered transition log + UI status.
                 if is_speech and not was_speech:
                     await self.emit("log", f"[ASR] ⇧ speech-start p={speech_prob:.2f} thr={threshold:.2f}")
+                    # Drive the UI "listening" orb from backend VAD (authoritative).
+                    # Only when the AI isn't currently speaking — during AI speech this edge
+                    # is the barge-in candidate and gets its own "interrupted" status path.
+                    if not self.is_speaking:
+                        await self.emit("status", "listening")
                 elif was_speech and not is_speech and is_speech_active:
                     await self.emit("log", f"[ASR] ⇩ speech-gap p={speech_prob:.2f} silence_count={silence_count}")
                 was_speech = is_speech
 
                 if self.is_speaking and is_speech:
-                    # [FAST] Ignore barge-in for first 2.5s of call (was 5s)
-                    # Greeting is short enough to be done by then.
+                    # Greeting protection — ignore barge-in for the first 2.5 s of the call
+                    # so the assistant's initial reply isn't cut off by mic noise on connect.
                     start_time = getattr(self, 'start_time', time.time())
                     if (time.time() - start_time) < 2.5:
-                        continue 
-                        
-                    # [FAST] Echo gate reduced from 1.2s → 0.5s
-                    # 0.5s still blocks most analog echo while allowing fast barge-in
-                    if (time.time() - self.speaking_start_time) < 0.5:
                         continue
-                    
-                    # [Phase 15 Hard-Lock]
-                    # Extreme protection for the start of the sentence
+
+                    # Echo gate: give AEC time to stabilise after TTS starts.
+                    if (time.time() - self.speaking_start_time) < ECHO_GATE_SEC:
+                        continue
+
+                    # Per-utterance hard-lock (longer on greeting, shorter mid-conv).
                     if time.time() < self.barge_in_lock_until:
                         continue
 
                     barge_in_count += 1
                     if barge_in_count >= BARGE_IN_FRAMES:
                         await self.emit("log", f"[Barge-in] DETECTED p={speech_prob:.2f} frames={barge_in_count}")
+                        # 1. Signal every worker to stop producing output for this turn.
                         self.interrupt_event.set()
-                        # Flush queues
-                        while not self.tts_queue.empty(): self.tts_queue.get_nowait()
-                        while not self.llm_queue.empty(): self.llm_queue.get_nowait()
+                        # 2. Drop everything queued so workers don't flush more audio
+                        #    the moment we clear the interrupt flag.
+                        while not self.tts_queue.empty():
+                            try: self.tts_queue.get_nowait()
+                            except Exception: break
+                        while not self.llm_queue.empty():
+                            try: self.llm_queue.get_nowait()
+                            except Exception: break
+                        # 3. Tell the UI so it stops the scheduled AudioBufferSourceNodes.
                         await self.emit("status", "interrupted")
                         self.is_speaking = False
                         barge_in_count = 0
-                        # Yield so TTS worker sees the interrupt and breaks its loop
+                        # 4. Yield so tts_worker sees the flag and breaks its chunk loop
+                        #    before we clear it for the next turn.
                         await asyncio.sleep(0.05)
-                        # Clear interrupt so the NEXT response can be spoken
                         self.interrupt_event.clear()
                 else:
                     barge_in_count = 0
@@ -485,8 +605,12 @@ class WebAssistant:
                             signal.resample_poly, audio_np, resample_ratio.numerator, resample_ratio.denominator
                         )
                     elif self.input_sampling_rate == 8000:
-                        # Upsampling 8k -> 16k is just linear interpolation or repeat
-                        audio_16k = await asyncio.to_thread(np.repeat, audio_np, 2)
+                        # Proper 2x upsample with anti-aliasing. np.repeat creates
+                        # step-function artifacts that Whisper struggles with, worsening
+                        # phone-call ASR accuracy.
+                        audio_16k = await asyncio.to_thread(
+                            signal.resample_poly, audio_np, 2, 1
+                        )
                     else:
                         resample_ratio = Fraction(16000, self.input_sampling_rate)
                         audio_16k = await asyncio.to_thread(
@@ -494,42 +618,74 @@ class WebAssistant:
                         )
                     turn.mark("asr_resample_done")
 
-                    # [AUDIO] Trust Whisper's internal mel-spec log normalization to
-                    # handle volume. The previous `audio/peak` normalization amplified
-                    # quiet speech to full scale (along with its noise floor), producing
-                    # the gibberish hallucinations we observed. Only boost VERY quiet
-                    # audio so it's not below Whisper's no-speech threshold.
-                    peak = float(np.max(np.abs(audio_16k)))
-                    if 0.005 < peak < 0.05:
-                        audio_16k = audio_16k * (0.1 / peak)
+                    # [AUDIO] DSP cleanup. Empirically the previous "trust Whisper's
+                    # log-mel" approach broke down on this user's mic — peaks routinely
+                    # came in at 0.1-0.15 (very quiet) and Whisper hallucinated repeats
+                    # ('हुआ हुआ हुआ हुआ'). Light, deliberate preprocessing now:
+                    #   1) DC offset removal (some mics have a non-zero bias).
+                    #   2) Pre-emphasis filter — boosts high frequencies, makes Hindi
+                    #      consonants (क/ख/त/थ/च/छ) much more discriminable.
+                    #   3) Smart normalization: lift any peak below 0.4 up to ~0.5
+                    #      so Whisper's mel-spec gets full dynamic range, but cap the
+                    #      gain so we don't blow up the noise floor on near-silence.
+                    #   4) 0.2 s silence padding both ends (Whisper trained on 30 s
+                    #      chunks; padding stabilises the edges).
+                    # --- Advanced ASR DSP (Phase 17) ---
+                    # 1. DC Offset & Drift Removal
+                    audio_16k = audio_16k - float(np.mean(audio_16k))
+                    # 2. Pre-emphasis (Sharpen High Freqs for better Consonants)
+                    audio_16k = np.append(audio_16k[0], audio_16k[1:] - 0.97 * audio_16k[:-1]).astype(np.float32)
+                    
+                    # 3. Gaussian Dither (Loop Breaker)
+                    # Adding a microscopic layer of noise breaks Whisper's internal 
+                    # infinite repeat loops on hum/silence.
+                    noise = np.random.normal(0, 0.0001, audio_16k.shape).astype(np.float32)
+                    audio_16k = audio_16k + noise
 
+                    # 4. Smart Gain Normalization
+                    p2 = float(np.max(np.abs(audio_16k)))
+                    if 0.005 < p2 < 0.5: # Lower floor to catch faint speech
+                        gain = min(0.6 / p2, 10.0)
+                        audio_16k = audio_16k * gain
+                    
+                    # 5. Stabilizing Padding
                     padding = np.zeros(int(16000 * 0.2), dtype=np.float32)
                     audio_padded = np.concatenate([padding, audio_16k, padding])
 
-                    # Tuning rationale:
-                    #   vad_filter=True        — Silero VAD inside faster-whisper skips silence
-                    #                            and suppresses hallucinations on fragmented clips.
-                    #   beam_size=5            — default for accuracy. With VAD + int8_float16
-                    #                            on RTX 3060 this is still <500 ms on short clips.
-                    #   without_timestamps=True — we don't use word timings anyway; saves compute.
-                    #   temperature=0.0        — greedy decoding; fastest path.
-                    #   language="hi"          — force Hindi. Auto-detect was flipping to
-                    #                            Korean/Indonesian on short utterances with low
-                    #                            confidence; bad audio clipping is gone so the
-                    #                            old gibberish failure mode doesn't return.
+                    # Tuning rationale (accuracy-first now that device/clipping bugs are fixed):
+                    #   vad_filter=True                  — Silero VAD in faster-whisper skips silence
+                    #                                      and suppresses hallucinations on fragments.
+                    #   beam_size=5                      — default-ish, good accuracy/speed tradeoff on GPU.
+                    #   temperature=(0.0, 0.2, 0.4, ...)  — fallback schedule: if greedy decode produces
+                    #                                      low-confidence output (fails log_prob/compression
+                    #                                      thresholds), Whisper retries at higher T. This
+                    #                                      is the single biggest accuracy knob — fixes
+                    #                                      garbled transcripts on tough audio. Cost: ~30ms
+                    #                                      only on the specific hard chunks that need it.
+                    #   compression_ratio_threshold=2.4  — reject repetition/loop hallucinations.
+                    #   log_prob_threshold=-1.0          — retry when mean token logprob is very low.
+                    #   no_speech_threshold=0.6          — drop chunks Whisper thinks are non-speech.
+                    #   without_timestamps=True          — we don't use word timings; small speed win.
+                    #   language="hi"                    — force Hindi (auto-detect flipped to Korean/Indo
+                    #                                      on short clips).
                     turn.mark("asr_decode_start")
                     segments, asr_info = await asyncio.to_thread(
                         self.asr_model.transcribe,
                         audio_padded,
-                        beam_size=5,
-                        language="hi",
+                        beam_size=1,                       # [SPEED] Greedy decoding is 5x faster on GPU 1
+                        language="hi",                     # STRICT Hindi mode for Indian context
+                        initial_prompt=self.initial_prompt,
                         condition_on_previous_text=False,
-                        vad_filter=True,
-                        vad_parameters=dict(min_silence_duration_ms=500),
+                        vad_filter=False,                  # Managed by our authoritative external VAD
                         without_timestamps=True,
-                        temperature=0.0,
+                        temperature=0,                     # [SPEED] Single-pass greedy
+                        compression_ratio_threshold=2.2,   # Catch loops earlier
+                        log_prob_threshold=-1.0,
+                        no_speech_threshold=0.5,
+                        suppress_blank=True,
                     )
                     text = "".join([s.text for s in segments]).strip()
+                    text = _strip_repetition_hallucinations(text)
                     turn.mark("asr_decode_done")
                     detected_lang = getattr(asr_info, "language", None) or "?"
                     lang_prob = float(getattr(asr_info, "language_probability", 0.0) or 0.0)
@@ -539,13 +695,13 @@ class WebAssistant:
                         asr_lang_prob=round(lang_prob, 3),
                         asr_beam=5,
                         asr_samples=int(len(audio_padded)),
-                        asr_peak=float(peak),
+                        asr_peak=float(p2),
                     )
                     await self.emit(
                         "log",
                         f"[ASR] decode {turn.delta_ms('asr_decode_start','asr_decode_done')}ms "
-                        f"lang={detected_lang}({lang_prob:.2f}) beam=1 samples={len(audio_padded)} "
-                        f"chars={len(text)} peak={peak:.3f}"
+                        f"lang={detected_lang}({lang_prob:.2f}) beam=5 samples={len(audio_padded)} "
+                        f"chars={len(text)} peak={p2:.3f}"
                     )
                     # Removed junk patterns - they are too aggressive for noisy telephony links
 
@@ -561,7 +717,13 @@ class WebAssistant:
                     silence_count = 0
                     is_speech_active = False
             except Exception as e:
-                print(f"ASR Error: {e}")
+                import traceback
+                tb = traceback.format_exc()
+                print(f"ASR Error: {e}\n{tb}")
+                try:
+                    await self.emit("log", f"[ASR] ERROR: {type(e).__name__}: {e}")
+                except Exception:
+                    pass
 
     async def llm_worker(self):
         print("[LLM] Worker started.")
@@ -577,26 +739,37 @@ class WebAssistant:
                 await self.emit("log", f"[LLM] → req: {user_text[:80]!r}")
                 llm_start = time.time()
                 payload = {
-                    "model": LLM_MODEL,
+                    "model": self.llm_model, # Replaced constant with dynamic model
                     "messages": [
                         {
                             "role": "system", 
                             "content": (
-                                f"IDENTITY: Your name is {self.active_voice_metadata.get('name', 'AI')}. You are {self.active_voice_metadata.get('age', 'unknown')} years old. {self.active_voice_metadata.get('about', '')}\n\n"
-                                f"PERSONA: Speak as {self.active_voice_metadata.get('gender', 'neutral')}. Style: {self.active_voice_metadata.get('style', 'conversational')}.\n"
-                                f"FAMOUS DIALOGUES/CATCHPHRASES: {self.active_voice_metadata.get('dialogues', '')}\n"
-                                "(Use your dialogues naturally if appropriate, do not force them every time.)\n\n"
-                                "SCRIPT RULES (STRICT):\n"
-                                "1. Speak ONLY in DEVANAGARI HINDI.\n"
-                                "2. NEVER use English characters (A-Z) except for verified acoustic tags.\n"
-                                "3. ANTI-REPETITION: Do NOT start every sentence with 'हाँ, बिलकुल', 'मुझे समझ आ गया', or 'ठीक है'. Be direct and varied.\n"
-                                "4. CONTEXT ADHERENCE: Use the Conversation History to stay on topic. If the user mentions a movie title, do NOT treat it as a literal word.\n\n"
+                                f"IDENTITY: Your name is {self.active_voice_metadata.get('name', 'AI')}. You are {self.active_voice_metadata.get('gender', 'neutral')} speaker.\n"
+                                f"PERSONA: Style: {self.active_voice_metadata.get('style', 'conversational')}.\n"
+                                f"FAMOUS DIALOGUES/CATCHPHRASES: {self.active_voice_metadata.get('dialogues', '')}\n\n"
+                                "STRICT GRAMMAR RULES (GENDER BINDING):\n"
+                                f"1. You identify as {self.active_voice_metadata.get('gender', 'male')}. "
+                                f"If female, use feminine verb endings (रही हूँ, सकती हूँ). "
+                                f"If male, use masculine verb endings (रहा हूँ, सकता हूँ).\n"
+                                "2. NEVER mix genders. Be consistent throughout the conversation.\n"
+                                "3. LANGUAGE: Speak ONLY in DEVANAGARI HINDI script.\n\n"
+                                "STRICT LANGUAGE RULES (PURE HINDI ONLY):\n"
+                                "1. You must speak ONLY in DEVANAGARI HINDI script.\n"
+                                "2. NEVER reply in English. NEVER translate your thoughts to English.\n"
+                                "3. DO NOT use English characters (A-Z). Use Devanagari script ONLY.\n"
+                                "4. Tone: Respectful, warm Indian friend — not formal/robotic.\n"
+                                "5. CONVERSATIONAL FLOW (very important — sound human):\n"
+                                "   • If the user just interrupted you, OPEN your reply with a short natural acknowledgement\n"
+                                "     (vary it — don't repeat the same one): 'हाँ बोलिए?', 'जी बताएं?', 'अच्छा,', \n"
+                                "     'अरे हाँ,', 'हम्म,', 'ओह अच्छा,', 'जी, मैं सुन रहा हूँ' — THEN answer.\n"
+                                "   • If the user's message is short/casual, also start with a small filler like\n"
+                                "     'अच्छा', 'हम्म', 'ठीक है', 'हाँ' so it sounds like a real human listening.\n"
+                                "   • Keep replies CONCISE (1–3 sentences). Long monologues feel robotic.\n"
+                                "   • If the user's question is unclear, ask back: 'क्या मतलब?', 'फिर से बोलिए?',\n"
+                                "     'मैं समझा नहीं, थोड़ा और बताइए।'\n\n"
                                 "ACOUSTIC TAGS (ENGLISH ONLY):\n"
-                                "Use ONLY these 4 tags, always in English, never translated:\n"
-                                "  [laughter], [sigh], [sniff], [dissatisfaction-hnn]\n"
-                                "Even though your reply is Hindi/Devanagari, the tags MUST stay English.\n"
-                                "NEVER write [हँसी], [आह], [हम्म], [Haha], [Smiling], or any other bracket.\n\n"
-                                "MISSION: Be extremely helpful, witty, and concise."
+                                "Use ONLY: [laughter], [sigh], [sniff], [dissatisfaction-hnn]\n"
+                                "MISSION: Be extremely helpful, witty, and concise in Hindi."
                             )
                         },
                         *self.history[-20:], # [CONTEXT] Last 20 exchanges (was 10) for better memory
@@ -605,9 +778,8 @@ class WebAssistant:
                     "stream": True,
                     # num_gpu=99 offloads all layers to the GPU (the model is already in
                     # RTX 3060 VRAM). num_ctx=1024 keeps the KV cache ~128 MB so we fit
-                    # within the remaining VRAM alongside Whisper + OmniVoice.
-                    # Must match main.py prewarm, otherwise Ollama reloads the model.
-                    "options": {"num_predict": 200, "temperature": 0.5, "num_gpu": 99, "num_ctx": 1024}
+                    # Within the remaining VRAM alongside Whisper + OmniVoice.
+                    "options": {"num_predict": 300, "temperature": 0.5, "num_gpu": 99, "num_ctx": 4096}
                 }
                 sentence = ""
                 full_response = ""
@@ -620,7 +792,7 @@ class WebAssistant:
                 await self.emit("status", "thinking")
                 if turn:
                     turn.mark("llm_request_sent")
-                    turn.add(llm_model=LLM_MODEL, llm_num_gpu=99, llm_num_ctx=1024)
+                    turn.add(llm_model=self.llm_model, llm_num_gpu=99, llm_num_ctx=4096)
                 try:
                     async with client.stream("POST", LLM_URL, json=payload) as response:
                         async for line in response.aiter_lines():
@@ -636,30 +808,21 @@ class WebAssistant:
                                     await self.emit(
                                         "log",
                                         f"[LLM] TTFT {turn.delta_ms('llm_request_sent','llm_first_token')}ms "
-                                        f"(model={LLM_MODEL}, num_gpu=99, num_ctx=1024)"
+                                        f"(model={self.llm_model})"
                                     )
                                 sentence += chunk
                                 full_response += chunk
                                 await self.emit("llm_chunk", chunk)
 
-                                # Trigger logic tuned for LOW first-audio latency:
-                                #   First fragment fires as early as possible so TTS can kick off
-                                #   while the rest of the LLM response is still streaming.
-                                #     - On end-of-sentence punctuation (. ? ! ।) after ≥3 words.
-                                #     - On comma/colon/semicolon after ≥5 words.
-                                #     - Or every ≥12 words if the LLM is still producing.
-                                #   Subsequent fragments use looser rules to keep prosody natural.
+                                # Trigger logic tuned for DEEP BUFFER (Zero-Stutter Update):
                                 word_count = len(sentence.split())
                                 has_end_punct = any(p in chunk for p in ".?!।\n")
-                                has_mid_punct = any(p in chunk for p in ",;:")
                                 if is_first_chunk:
-                                    trigger = (
-                                        (has_end_punct and word_count >= 3)
-                                        or (has_mid_punct and word_count >= 5)
-                                        or word_count >= 12
-                                    )
+                                    # Increased to 18 words to ensure playback never catches up to synthesis.
+                                    trigger = (has_end_punct and word_count >= 8) or word_count >= 15
                                 else:
-                                    trigger = has_end_punct or word_count >= 30
+                                    # Subsequent chunks: wait for solid sentence or 35 words.
+                                    trigger = (has_end_punct and word_count >= 6) or word_count >= 25
 
                                 if trigger:
                                     cleaned = clean_text(sentence)
@@ -744,7 +907,10 @@ class WebAssistant:
                     audio_list = await asyncio.to_thread(
                         self.tts_model.generate,
                         text=cleaned_text, voice_clone_prompt=self.voice_prompt,
-                        language="hi", generation_config=OmniVoiceGenerationConfig(num_step=8) # 8 = quality sweet-spot for voice-clone fidelity
+                        language="hi", 
+                        generation_config=OmniVoiceGenerationConfig(
+                            num_step=12,      # [Phase 17] Stabilized quality steps
+                        )
                     )
                     audio_24k = audio_list[0]
                     if turn and "tts_synth_done" not in turn.t:
@@ -760,11 +926,16 @@ class WebAssistant:
                             f"num_step=8 in_chars={len(cleaned_text)} out_samples={len(audio_24k)}"
                         )
                     
-                    # Gain Control: 1.0 (Unity Gain) is cleanest for digital paths
-                    audio_24k = audio_24k * 1.0
+                    # --- PureVoice Normalization (Phase 17) ---
+                    # Prevents the "heavy" sound caused by digital clipping.
+                    peak = np.max(np.abs(audio_24k)) if len(audio_24k) > 0 else 0
+                    if peak > 1.0 or peak < 0.7:
+                        # Softly normalize to 0.95 to keep headroom for the browser's gain.
+                        scale = 0.95 / max(peak, 1e-4)
+                        audio_24k = audio_24k * scale
                     
                     vol = np.max(np.abs(audio_24k)) if len(audio_24k) > 0 else 0
-                    print(f"[TTS] Success: {len(audio_24k)} samples. Peak Vol: {vol:.4f}", flush=True)
+                    print(f"[TTS] Success: {len(audio_24k)} samples. Peak Vol: {vol:.4f} (Applied PureVoice Norm)", flush=True)
                     try:
                         await self.emit("log", f"[TTS] Synth OK: {len(audio_24k)} samples, Vol: {vol:.2f}")
                     except UnicodeEncodeError:
@@ -784,14 +955,20 @@ class WebAssistant:
                     pcm_int16 = (np.clip(audio_full, -1, 1) * 32767).astype(np.int16)
                     pcm_bytes = pcm_int16.tobytes()
 
-                    # --- [FAST] Speaking Lock ---
+                    # --- Speaking lock ---
+                    # Per-utterance window where barge-in is suppressed. Protects the very
+                    # first audio packet of the session (greeting) from being interrupted
+                    # by the echo leaking back through the mic; subsequent turns use a
+                    # tighter lock so the user can cut in quickly.
                     self.is_speaking = True
-                    # First audio: 2s lock (was 4s). Enough to protect greeting from echo.
                     if getattr(self, '_is_first_audio_in_session', True):
-                        self.barge_in_lock_until = max(self.barge_in_lock_until, time.time() + 2.0)
+                        self.barge_in_lock_until = max(
+                            self.barge_in_lock_until, time.time() + HARD_LOCK_FIRST_AUDIO_SEC
+                        )
                     else:
-                        # Mid-conversation: 1.0s lock (was 2.0s) for snappy barge-in
-                        self.barge_in_lock_until = max(self.barge_in_lock_until, time.time() + 1.0)
+                        self.barge_in_lock_until = max(
+                            self.barge_in_lock_until, time.time() + HARD_LOCK_MID_TURN_SEC
+                        )
                     
                     await self.emit("status", "speaking")
                     

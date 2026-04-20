@@ -18,11 +18,12 @@ import time
 import psutil # For High-Priority scheduling
 
 # Add project root and backend dir to sys.path for robust imports
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.dirname(BACKEND_DIR)
-for p in [ROOT_DIR, BACKEND_DIR]:
+# This ensures that even if run from root, modules like 'engine' are found.
+ROOT_DIR = r"e:\Ai\Omini with Astrisk\Omini"
+BACKEND_DIR = os.path.join(ROOT_DIR, "web_backend")
+for p in [BACKEND_DIR, ROOT_DIR]:
     if p not in sys.path:
-        sys.path.append(p)
+        sys.path.insert(0, p)
 
 import json
 import re
@@ -34,10 +35,22 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from engine import WebAssistant, _models
-from audio_utils import trim_audio_file
+try:
+    from web_backend.engine import WebAssistant, _models
+except ImportError:
+    from engine import WebAssistant, _models
+
+try:
+    from web_backend.audio_utils import trim_audio_file
+except ImportError:
+    from audio_utils import trim_audio_file
+
 from datetime import datetime
-from asterisk_bridge_helper import VaaniAsteriskBridge
+
+try:
+    from web_backend.asterisk_bridge_helper import VaaniAsteriskBridge
+except ImportError:
+    from asterisk_bridge_helper import VaaniAsteriskBridge
 
 
 ARI_BASE_URL = "http://192.168.8.59:8088/ari"
@@ -381,6 +394,17 @@ async def dial_number(req: DialRequest):
 async def get_voices():
     return load_voices()
 
+@app.get("/models/llm")
+async def get_llm_models():
+    """Returns a list of available LLM models for the settings UI."""
+    # These match the models we verified are installed in your Ollama
+    return [
+        {"id": "gemma3:4b", "name": "Gemma 3 (4B) - Default"},
+        {"id": "qwen2:7b", "name": "Qwen 2 (7B) - High IQ"},
+        {"id": "gemma4:e4b", "name": "Gemma 4 (Large)"},
+        {"id": "mashriram/sarvam-m:latest", "name": "Sarvam (M-Hinglish)"}
+    ]
+
 @app.post("/voices/upload")
 async def upload_voice(
     name: str = Form(...),
@@ -641,9 +665,20 @@ async def websocket_endpoint(websocket: WebSocket):
     # adaptive threshold (4×) masks quiet user voice. Close the turn cleanly.
     await assistant.tts_queue.put("__END_RESPONSE__")
 
-    # Diagnostic: dump the first 3 inbound audio chunks so we can confirm whether
-    # the browser is sending real PCM or silent buffers. Visible in LogViewer.
+    # Diagnostic: log first 3 chunks + every 500th chunk so we can confirm PCM is
+    # non-zero when the user speaks (not just at idle). Visible in LogViewer.
     diag_count = 0
+
+    import struct
+
+    def _mic_diag(raw: bytes, label: str) -> str:
+        sample_count = len(raw) // 2
+        head16 = raw[:16].hex()
+        try:
+            peak_i16 = max(abs(s) for s in struct.unpack(f"<{min(sample_count, 256)}h", raw[:min(len(raw), 512)])) if sample_count else 0
+        except Exception:
+            peak_i16 = -1
+        return f"[WS-MIC-DIAG {label}] bytes={len(raw)} samples={sample_count} peak_int16={peak_i16} head_hex={head16}"
 
     try:
         while True:
@@ -652,19 +687,10 @@ async def websocket_endpoint(websocket: WebSocket):
                  break
             if "bytes" in message:
                 raw = message["bytes"]
-                if diag_count < 3:
-                    diag_count += 1
-                    import struct
-                    sample_count = len(raw) // 2
-                    head16 = raw[:16].hex()
-                    try:
-                        peak_i16 = max(abs(s) for s in struct.unpack(f"<{min(sample_count, 256)}h", raw[:min(len(raw), 512)])) if sample_count else 0
-                    except Exception:
-                        peak_i16 = -1
-                    await broadcast_log(
-                        "log",
-                        f"[WS-MIC-DIAG #{diag_count}] bytes={len(raw)} samples={sample_count} peak_int16={peak_i16} head_hex={head16}",
-                    )
+                diag_count += 1
+                if diag_count <= 3 or diag_count % 500 == 0:
+                    label = f"#{diag_count}" if diag_count <= 3 else f"periodic#{diag_count}"
+                    await broadcast_log("log", _mic_diag(raw, label))
                 await assistant.asr_queue.put(raw)
             elif "text" in message:
                 data = json.loads(message["text"])
@@ -676,6 +702,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     assistant.interrupt_event.clear()
                     await websocket.send_json({"type": "status", "data": "interrupted"})
                 
+                elif data.get("type") == "switch_model":
+                    new_model = data.get("model_id")
+                    if new_model:
+                        print(f"[WS] Switching model to: {new_model}")
+                        assistant.llm_model = new_model
+                        await websocket.send_json({"type": "status", "data": f"Model switched to {new_model}"})
+
+                elif data.get("type") == "reset_chat":
+                    print(f"[WS] Resetting chat session and memory")
+                    assistant.reset_session()
+                    await websocket.send_json({"type": "status", "data": "Chat history cleared"})
+
+                elif data.get("type") == "log_forward":
+                    await broadcast_log("log", f"[FRONTEND] {data.get('data')}")
+
                 elif data.get("type") == "switch_voice":
                     voice_id = data.get("voice_id")
                     voices = load_voices()

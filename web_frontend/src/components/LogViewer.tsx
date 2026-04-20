@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useState, useRef } from "react";
-import { Terminal, ScrollText, XCircle } from "lucide-react";
+import { Terminal, ScrollText, XCircle, Copy, Check } from "lucide-react";
 
 interface LogEntry {
   type: string;
@@ -12,8 +12,21 @@ interface LogEntry {
 export default function LogViewer() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isOpen, setIsOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
+
+  const handleCopy = () => {
+    const logText = logs.map(log => {
+      const time = new Date(log.timestamp * 1000).toLocaleTimeString();
+      const data = typeof log.data === 'string' ? log.data : JSON.stringify(log.data);
+      return `[${time}] [${log.type}] ${data}`;
+    }).join('\n');
+
+    navigator.clipboard.writeText(logText);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
 
   useEffect(() => {
     const connect = () => {
@@ -74,9 +87,18 @@ export default function LogViewer() {
           <ScrollText className="w-4 h-4 text-green-400" />
           <span className="text-xs font-mono font-bold tracking-wider text-white/80 uppercase">Live Debug Console</span>
         </div>
-        <button onClick={() => setIsOpen(false)} className="hover:text-red-400 text-white/40 transition-colors">
-          <XCircle className="w-5 h-5" />
-        </button>
+        <div className="flex items-center gap-4">
+          <button 
+            onClick={handleCopy}
+            className={`p-1.5 rounded-md transition-all ${copied ? 'text-emerald-400 bg-emerald-500/10' : 'text-white/40 hover:text-white hover:bg-white/10'}`}
+            title="Copy Logs"
+          >
+            {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+          </button>
+          <button onClick={() => setIsOpen(false)} className="hover:text-red-400 text-white/40 transition-colors">
+            <XCircle className="w-5 h-5" />
+          </button>
+        </div>
       </div>
       
       <div 
