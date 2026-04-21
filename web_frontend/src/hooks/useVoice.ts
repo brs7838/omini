@@ -34,48 +34,91 @@ export function useVoice(activeVoiceId: string = "ravi") {
   // Silent sink for the ScriptProcessor (it must connect to *something* to run,
   // but routing it through a gain=0 node prevents a mic→speaker feedback loop).
   const micSinkRef = useRef<GainNode | null>(null);
+  // Active <audio> elements playing current TTS blobs — tracked so barge-in /
+  // interrupt can stop them immediately.
+  const activePlaybackElsRef = useRef<HTMLAudioElement[]>([]);
+
+  // Wrap int16 PCM samples (mono, little-endian) in a minimal RIFF/WAVE header
+  // so the browser's native audio decoder interprets them at the stated rate.
+  // This is the SAME path the TTS lab uses, which is why the lab's playback is
+  // pitch-stable while our old createBuffer(...) path was not — Web Audio's
+  // internal 24 k→48 k resampler (AudioContext runs at hardware rate) was
+  // introducing audible pitch modulation on long samples; <audio> + blob URL
+  // hands the rate conversion to the OS SRC which is clean.
+  const pcmToWavBlob = (pcmBytes: ArrayBuffer, sampleRate: number): Blob => {
+    const pcmLen = pcmBytes.byteLength;
+    const headerLen = 44;
+    const buf = new ArrayBuffer(headerLen + pcmLen);
+    const view = new DataView(buf);
+    const writeAscii = (offset: number, s: string) => {
+      for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
+    };
+    writeAscii(0, "RIFF");
+    view.setUint32(4, 36 + pcmLen, true);
+    writeAscii(8, "WAVE");
+    writeAscii(12, "fmt ");
+    view.setUint32(16, 16, true);               // PCM fmt chunk size
+    view.setUint16(20, 1, true);                // PCM format
+    view.setUint16(22, 1, true);                // channels (mono)
+    view.setUint32(24, sampleRate, true);       // sample rate
+    view.setUint32(28, sampleRate * 2, true);   // byte rate (1ch * 2 bytes)
+    view.setUint16(32, 2, true);                // block align
+    view.setUint16(34, 16, true);               // bits per sample
+    writeAscii(36, "data");
+    view.setUint32(40, pcmLen, true);
+    new Uint8Array(buf, headerLen).set(new Uint8Array(pcmBytes));
+    return new Blob([buf], { type: "audio/wav" });
+  };
+
+  // Hard-stop all currently-playing TTS elements. `pause()` alone is not
+  // always sufficient to halt an <audio> element that has an in-flight blob
+  // decoder — detaching `src` + `load()` drops the media resource and frees
+  // buffered samples so there's no audible tail after barge-in or a new reply.
+  const stopAllPlayback = () => {
+    activePlaybackElsRef.current.forEach(el => {
+      try {
+        el.pause();
+        el.removeAttribute("src");
+        el.load();
+      } catch { /* element may already be detached */ }
+    });
+    activePlaybackElsRef.current = [];
+  };
 
   // --- Audio playback (declared before connect so it can be referenced) ---
   const playSerializedAudio = useCallback(async (data: Blob, sampleRate: number) => {
-    if (!audioContextRef.current) return;
+    // Kill any previous reply's playback before starting this one. Without
+    // this, a delayed "interrupted" event or a quick back-to-back turn let
+    // the old <audio> element bleed into the first ~second of the new one —
+    // audible as a brief voice overlap at the start of each reply.
+    stopAllPlayback();
 
-    const arrayBuffer = await data.arrayBuffer();
-    const int16Array = new Int16Array(arrayBuffer);
-    const float32Array = new Float32Array(int16Array.length);
+    const pcmBuffer = await data.arrayBuffer();
+    const wavBlob = pcmToWavBlob(pcmBuffer, sampleRate);
+    const url = URL.createObjectURL(wavBlob);
 
-    for (let i = 0; i < int16Array.length; i++) {
-      float32Array[i] = int16Array[i] / 32768.0;
-    }
+    const el = new Audio();
+    el.src = url;
+    el.autoplay = true;
+    el.preload = "auto";
+    // Explicit play() — autoplay alone isn't guaranteed to fire synchronously
+    // on every browser/version, and we want playback to start the moment the
+    // blob is ready so replies aren't perceived as laggy.
+    el.play().catch(err => console.warn("[Audio] play() rejected:", err));
 
-    const buffer = audioContextRef.current.createBuffer(1, float32Array.length, sampleRate);
-    buffer.getChannelData(0).set(float32Array);
-
-    const source = audioContextRef.current.createBufferSource();
-    source.buffer = buffer;
-    // [BARGE-IN FIX] Route into MediaStreamDestinationNode (which a hidden
-    // <audio> element plays). The browser's echo canceller treats <audio>
-    // playback as a known reference signal and subtracts only the actual TTS
-    // — leaving the user's voice intact during AI speech, so barge-in works.
-    // Falls back to direct destination if the playback graph isn't ready.
-    if (playbackDestRef.current) {
-      source.connect(playbackDestRef.current);
-    } else {
-      source.connect(audioContextRef.current.destination);
-    }
-
-    const now = audioContextRef.current.currentTime;
-    const startTime = Math.max(nextStartTimeRef.current, now);
-
-    console.log(`[Audio] Playing chunk: ${buffer.duration.toFixed(3)}s @ ${startTime.toFixed(3)}s (ContextTime: ${now.toFixed(3)}s)`);
-    source.start(startTime);
-    scheduledNodesRef.current.push(source);
-    source.onended = () => {
-      // Clean up reference after playback to prevent memory leaks
-      scheduledNodesRef.current = scheduledNodesRef.current.filter(n => n !== source);
+    activePlaybackElsRef.current.push(el);
+    const cleanup = () => {
+      URL.revokeObjectURL(url);
+      activePlaybackElsRef.current = activePlaybackElsRef.current.filter(a => a !== el);
+      // If nothing else is playing, drop back to idle so the UI mic reopens.
+      if (activePlaybackElsRef.current.length === 0) {
+        setState(prev => (prev === "speaking" ? "idle" : prev));
+      }
     };
+    el.onended = cleanup;
+    el.onerror = cleanup;
 
-    nextStartTimeRef.current = startTime + buffer.duration;
-
+    console.log(`[Audio] Playing WAV blob: ${(pcmBuffer.byteLength / 2 / sampleRate).toFixed(3)}s`);
     setState("speaking");
   }, []);
 
@@ -109,6 +152,10 @@ export function useVoice(activeVoiceId: string = "ravi") {
               try { node.stop(); } catch { }
             });
             scheduledNodesRef.current = [];
+            // Hard-stop the blob-URL <audio> elements (pause + detach + load)
+            // so barge-in halts TTS instantly instead of letting the decoder
+            // finish buffered samples.
+            stopAllPlayback();
             nextStartTimeRef.current = audioContextRef.current?.currentTime || 0;
           }
         } else if (msg.type === "llm_chunk") {
@@ -123,7 +170,20 @@ export function useVoice(activeVoiceId: string = "ravi") {
       }
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
+      // Forward the close event to the backend so it appears in backend.log —
+      // helps tell StrictMode remounts / ping timeouts / clean user stops apart.
+      try {
+        fetch("http://127.0.0.1:8000/debug/ws_close", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          keepalive: true,
+          body: JSON.stringify({
+            code: ev.code, reason: ev.reason, wasClean: ev.wasClean, ts: Date.now(),
+          }),
+        }).catch(() => {});
+      } catch {}
+      console.log(`[WS onclose] code=${ev.code} reason=${ev.reason} wasClean=${ev.wasClean}`);
       if (reconnectAttemptsRef.current < 5) {
         const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 10000);
         console.log(`WS Closed. Reconnecting in ${delay}ms... (Attempt ${reconnectAttemptsRef.current + 1})`);

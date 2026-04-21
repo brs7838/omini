@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TTS Lab — Omini</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --panel2: #1f2630;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --accent: #4c9aff;
+    --accent2: #2ea043;
+    --border: #30363d;
+    --danger: #da3633;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", "Noto Sans Devanagari", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.45;
+  }
+  header {
+    padding: 14px 20px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  .status { font-size: 12px; color: var(--muted); font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .status.ok { color: var(--accent2); }
+  .status.warn { color: #e3b341; }
+  main { max-width: 900px; margin: 20px auto; padding: 0 20px 40px; }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 18px; margin-bottom: 16px; }
+  section h2 { margin: 0 0 12px; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }
+  select, input[type=text], input[type=number], textarea {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; font-size: 14px; font-family: inherit;
+    width: 100%;
+  }
+  textarea { min-height: 80px; resize: vertical; }
+  select:focus, input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  .phrase-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+  .phrase-btn {
+    background: var(--panel2); border: 1px solid var(--border); color: var(--fg);
+    padding: 10px 12px; border-radius: 6px; cursor: pointer; text-align: left;
+    font-size: 13px; line-height: 1.35; transition: border-color .15s, background .15s;
+  }
+  .phrase-btn:hover { border-color: var(--accent); }
+  .phrase-btn.active { border-color: var(--accent); background: #1b2532; }
+  .phrase-btn .key { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; display: block; margin-bottom: 3px; }
+  .controls { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+  @media (max-width: 720px) { .controls { grid-template-columns: 1fr 1fr; } }
+  button.primary {
+    background: var(--accent); color: white; border: none; padding: 10px 18px;
+    border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button.primary:hover { filter: brightness(1.1); }
+  button.primary:disabled { opacity: .5; cursor: not-allowed; }
+  .output { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: var(--muted); white-space: pre-wrap; }
+  audio { width: 100%; margin-top: 10px; }
+  .history { display: flex; flex-direction: column; gap: 10px; }
+  .history-item {
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 12px; font-size: 13px;
+  }
+  .history-item .meta { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+  .history-item .text { margin-bottom: 6px; word-break: break-word; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; background: #1b2532; border: 1px solid var(--border); color: var(--accent); font-size: 11px; margin-right: 4px; }
+  .flex-between { display: flex; justify-content: space-between; align-items: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>TTS Lab — OmniVoice Pitch / Quality Harness</h1>
+  <div class="status" id="status">loading…</div>
+</header>
+<main>
+
+  <section>
+    <h2>Voice & Config</h2>
+    <div class="controls">
+      <div>
+        <label>Voice Avatar</label>
+        <select id="voice"></select>
+      </div>
+      <div>
+        <label>num_step</label>
+        <input type="number" id="num_step" value="12" min="1" max="64" />
+      </div>
+      <div>
+        <label>guidance_scale</label>
+        <input type="number" id="guidance_scale" value="2.0" step="0.1" />
+      </div>
+      <div>
+        <label>t_shift</label>
+        <input type="number" id="t_shift" value="0.1" step="0.05" />
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Preset Phrases (click to load into editor)</h2>
+    <div class="phrase-grid" id="phrases"></div>
+  </section>
+
+  <section>
+    <h2>Text to Synthesize</h2>
+    <textarea id="text" placeholder="Type Hindi (Devanagari) or mixed text here…"></textarea>
+    <div style="display: flex; gap: 12px; margin-top: 12px; align-items: center;">
+      <button class="primary" id="go">Synthesize &amp; Play</button>
+      <div class="output" id="out">Ready.</div>
+    </div>
+    <audio id="player" controls></audio>
+  </section>
+
+  <section>
+    <h2 class="flex-between"><span>History</span>
+      <button id="clear-history" style="background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer;">Clear</button>
+    </h2>
+    <div class="history" id="history"></div>
+  </section>
+
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const status = $('status');
+const voiceSel = $('voice');
+const phrasesEl = $('phrases');
+const textEl = $('text');
+const player = $('player');
+const out = $('out');
+const goBtn = $('go');
+const historyEl = $('history');
+
+let activePhraseKey = null;
+
+async function fetchJSON(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(`${url} -> ${r.status}`);
+  return await r.json();
+}
+
+async function loadStatus() {
+  try {
+    const s = await fetchJSON('/api/status');
+    if (s.model_loaded) {
+      status.className = 'status ok';
+      status.textContent = `device=${s.device} voice=${s.current_voice || 'none'}`;
+    } else {
+      status.className = 'status warn';
+      status.textContent = 'model loading…';
+      setTimeout(loadStatus, 1500);
+    }
+  } catch (e) {
+    status.className = 'status warn';
+    status.textContent = `status err: ${e.message}`;
+    setTimeout(loadStatus, 2000);
+  }
+}
+
+async function loadVoices() {
+  const { voices, default: def } = await fetchJSON('/api/voices');
+  voiceSel.innerHTML = '';
+  voices.forEach(v => {
+    const o = document.createElement('option');
+    o.value = v; o.textContent = v;
+    if (v === def) o.selected = true;
+    voiceSel.appendChild(o);
+  });
+}
+
+async function loadPhrases() {
+  const { phrases } = await fetchJSON('/api/phrases');
+  phrasesEl.innerHTML = '';
+  Object.entries(phrases).forEach(([key, text]) => {
+    const btn = document.createElement('button');
+    btn.className = 'phrase-btn';
+    btn.dataset.key = key;
+    const preview = text.length > 70 ? text.slice(0, 70) + '…' : text;
+    btn.innerHTML = `<span class="key">${key}</span>${escapeHtml(preview)}`;
+    btn.addEventListener('click', () => {
+      textEl.value = text;
+      document.querySelectorAll('.phrase-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      activePhraseKey = key;
+    });
+    phrasesEl.appendChild(btn);
+  });
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function synth() {
+  const text = textEl.value.trim();
+  if (!text) { out.textContent = 'enter text first.'; return; }
+  const voice = voiceSel.value;
+  const num_step = parseInt($('num_step').value, 10);
+  const guidance_scale = parseFloat($('guidance_scale').value);
+  const t_shift = parseFloat($('t_shift').value);
+
+  goBtn.disabled = true;
+  out.textContent = `synthesizing… voice=${voice} ns=${num_step}`;
+  const t0 = performance.now();
+
+  try {
+    const r = await fetch('/api/synth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ voice, text, num_step, guidance_scale, t_shift }),
+    });
+    if (!r.ok) {
+      let detail = `HTTP ${r.status}`;
+      try { const j = await r.json(); detail = j.detail || detail; } catch {}
+      throw new Error(detail);
+    }
+    const wallMs = Math.round(performance.now() - t0);
+    const synthMs = r.headers.get('X-Synth-Ms');
+    const audioS = r.headers.get('X-Audio-Seconds');
+    const peak = r.headers.get('X-Peak');
+    const device = r.headers.get('X-Device');
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    player.src = url;
+    player.play().catch(() => {});
+    const rtf = (parseFloat(synthMs) / 1000 / parseFloat(audioS)).toFixed(2);
+    out.textContent = `synth=${synthMs}ms wall=${wallMs}ms audio=${audioS}s RTF=${rtf} peak=${peak} dev=${device}`;
+
+    addHistory({ voice, num_step, guidance_scale, t_shift, text, synthMs, audioS, peak, device, url });
+  } catch (e) {
+    out.textContent = `error: ${e.message}`;
+  } finally {
+    goBtn.disabled = false;
+    loadStatus();
+  }
+}
+
+function addHistory(item) {
+  const el = document.createElement('div');
+  el.className = 'history-item';
+  const shortText = item.text.length > 160 ? item.text.slice(0, 160) + '…' : item.text;
+  el.innerHTML = `
+    <div class="meta">
+      <span class="badge">${item.voice}</span>
+      <span class="badge">ns=${item.num_step}</span>
+      <span class="badge">g=${item.guidance_scale}</span>
+      <span class="badge">t=${item.t_shift}</span>
+      <span>synth=${item.synthMs}ms audio=${item.audioS}s peak=${item.peak} dev=${item.device}</span>
+    </div>
+    <div class="text">${escapeHtml(shortText)}</div>
+    <audio controls src="${item.url}"></audio>
+  `;
+  historyEl.prepend(el);
+}
+
+$('clear-history').addEventListener('click', () => { historyEl.innerHTML = ''; });
+goBtn.addEventListener('click', synth);
+textEl.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') synth();
+});
+
+(async () => {
+  await Promise.all([loadVoices(), loadPhrases()]);
+  loadStatus();
+})();
+</script>
+</body>
+</html>

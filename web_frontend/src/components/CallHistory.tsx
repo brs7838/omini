@@ -60,14 +60,22 @@ export default function CallHistory({ isOpen, onClose, activeVoiceId }: CallHist
 
   useEffect(() => {
     if (isOpen) {
-      // Fetch once immediately, then poll
-      void fetchHistory();
+      // Defer initial fetch to avoid cascading render warning
+      const timeout = setTimeout(() => {
+        void fetchHistory();
+      }, 0);
+
       const interval = setInterval(() => {
         void fetchHistory();
       }, 5000);
-      return () => clearInterval(interval);
+
+      return () => {
+        clearTimeout(timeout);
+        clearInterval(interval);
+      };
     }
   }, [isOpen]);
+
 
   const getStatusIcon = (status: string) => {
     switch (status) {

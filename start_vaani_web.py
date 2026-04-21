@@ -5,6 +5,12 @@ import time
 import socket
 import httpx
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 # --- Environment Fixes (CRITICAL for Windows/NumPy Stability) ---
 os.environ["OPENBLAS_MAIN_FREE"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -15,6 +21,7 @@ os.environ["NPY_DISABLE_CPU_FEATURES"] = "AVX512F"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID" # Ensure index matches hardware
 os.environ["OLLAMA_MAX_LOADED_MODELS"] = "0"   # Force Ollama to be lean
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["HF_HUB_OFFLINE"] = "1"           # Force local model loading (Bypass DNS errors)
 # -------------------------------------------------------------
 
 def kill_port(port):
@@ -103,20 +110,55 @@ def run():
         
     time.sleep(1)
 
-    # Free any stale Ollama model caches before relaunching pinned to cuda:0.
-    print("[0.5/3] Freeing Ollama GPU cache...")
+    # Only manage the local Ollama server when it's actually the active LLM
+    # backend. Remote providers (e.g. Sarvam) are HTTP-only, so launching
+    # Ollama would just waste VRAM needed by OmniVoice + Whisper.
+    # Priority: persisted provider_config.json (written by /provider/switch)
+    # > env LLM_PROVIDER > default. Keeps the user's runtime choice sticky
+    # across restarts without them editing .env.
+    llm_provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
     try:
-        import urllib.request
-        for model in ["gemma3:4b", "gemma4:e4b"]:
-            req = urllib.request.Request("http://localhost:11434/api/generate",
-                data=f'{{"model":"{model}","keep_alive":0}}'.encode(), method="POST")
-            urllib.request.urlopen(req, timeout=5)
-    except Exception:
+        import json as _json
+        _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "provider_config.json")
+        with open(_cfg_path, "r", encoding="utf-8") as _f:
+            _cfg = _json.load(_f)
+        _persisted = (_cfg.get("provider") or "").strip().lower()
+        if _persisted in ("ollama", "sarvam"):
+            llm_provider = _persisted
+            print(f"[Launcher] Using persisted LLM provider: {llm_provider} "
+                  f"(model={_cfg.get('model')})")
+            # Mirror into env so the backend subprocess picks up the same choice
+            # before resolve_provider() runs at startup.
+            os.environ["LLM_PROVIDER"] = llm_provider
+            if _cfg.get("model"):
+                os.environ["LLM_MODEL"] = str(_cfg["model"])
+    except FileNotFoundError:
         pass
-    time.sleep(2)
+    except Exception as _e:
+        print(f"[Launcher] provider_config.json read skipped: {_e}")
+    if llm_provider == "ollama":
+        # Free any stale Ollama model caches before relaunching pinned to cuda:0.
+        print("[0.5/3] Freeing Ollama GPU cache...")
+        try:
+            import urllib.request
+            for model in ["gemma3:4b", "gemma4:e4b"]:
+                req = urllib.request.Request("http://localhost:11434/api/generate",
+                    data=f'{{"model":"{model}","keep_alive":0}}'.encode(), method="POST")
+                urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass
+        time.sleep(2)
 
-    # Restart Ollama pinned to RTX 3060 so gemma3:4b lives alongside OmniVoice.
-    restart_ollama_pinned()
+        # Restart Ollama pinned to RTX 3060 so gemma3:4b lives alongside OmniVoice.
+        restart_ollama_pinned()
+    else:
+        print(f"[0.5/3] LLM_PROVIDER={llm_provider} — skipping Ollama startup (remote API mode).")
+        # Best-effort: kill any lingering ollama.exe so it doesn't hold VRAM.
+        try:
+            subprocess.run(['taskkill', '/F', '/IM', 'ollama.exe'], capture_output=True)
+        except Exception:
+            pass
 
     # 2. Start Backend using UV
     print("[1/3] Starting FastAPI Backend on port 8000...")

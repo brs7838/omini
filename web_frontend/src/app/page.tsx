@@ -12,7 +12,9 @@ import LogViewer from "@/components/LogViewer";
 import Dialer from "@/components/Dialer";
 import CallHistory from "@/components/CallHistory";
 import ModelSettings from "@/components/ModelSettings";
-import { Phone, History } from "lucide-react";
+import SystemMonitor from "@/components/SystemMonitor";
+import SttChip from "@/components/SttChip";
+import { Phone, History, Activity } from "lucide-react";
 
 interface VoiceMeta { id: string; name: string }
 
@@ -69,6 +71,7 @@ export default function VocalisDashboard() {
   const [isDialerOpen,       setIsDialerOpen]          = useState(false);
   const [isHistoryOpen,      setIsHistoryOpen]          = useState(false);
   const [isModelSettingsOpen,setIsModelSettingsOpen]   = useState(false);
+  const [isSystemMonitorOpen,setIsSystemMonitorOpen]   = useState(false);
   const [activeModel, setActiveModel] = useState({ id: "gemma3:4b", name: "Gemma 3 (4B)" });
   const [voices, setVoices] = useState<VoiceMeta[]>([]);
 
@@ -133,6 +136,26 @@ export default function VocalisDashboard() {
   const sidebarActiveId  = viewingSessionId ?? (messages.length > 0 ? liveSessionId : null);
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [displayedMessages]);
+
+  // Hydrate activeModel from the backend on mount so a page refresh doesn't
+  // flash the hardcoded default (gemma3:4b) when the user's persisted choice
+  // is actually something else (e.g. sarvam-m). /system/status tells us the
+  // active model id; /models/llm is queried in parallel to get the pretty
+  // label so the header shows "Sarvam M (24B)" not the raw "sarvam-m".
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      fetch("http://127.0.0.1:8000/system/status").then(r => r.ok ? r.json() : null).catch(() => null),
+      fetch("http://127.0.0.1:8000/models/llm").then(r => r.ok ? r.json() : []).catch(() => []),
+    ]).then(([status, listing]) => {
+      if (cancelled) return;
+      const id = status?.models?.llm?.name;
+      if (!id) return;
+      const pretty = Array.isArray(listing) ? listing.find((m: { id: string; name: string }) => m.id === id) : null;
+      setActiveModel({ id, name: pretty?.name || id });
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   // Fetch voice names
   useEffect(() => {
@@ -234,6 +257,10 @@ export default function VocalisDashboard() {
               <span className="text-[10px] font-bold uppercase tracking-wider max-w-[90px] truncate">{activeVoiceName}</span>
             </button>
 
+            {/* STT chip — quick toggle between Sarvam (cloud) and local
+                Whisper. Whisper loads onto GPU only when selected. */}
+            <SttChip />
+
             {/* Model pill */}
             <button
               onClick={() => setIsModelSettingsOpen(true)}
@@ -278,6 +305,19 @@ export default function VocalisDashboard() {
               className="w-11 h-11 rounded-full bg-white/5 border border-white/10 flex items-center justify-center text-slate-500 hover:bg-indigo-500/10 hover:text-indigo-400 transition-all"
             >
               <History className="w-4 h-4" />
+            </button>
+
+            {/* System Monitor */}
+            <button
+              onClick={() => setIsSystemMonitorOpen(v => !v)}
+              className={`w-11 h-11 rounded-full border flex items-center justify-center transition-all ${
+                isSystemMonitorOpen
+                  ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-400"
+                  : "bg-white/5 border-white/10 text-slate-500 hover:bg-emerald-500/10 hover:text-emerald-400"
+              }`}
+              title="System Monitor"
+            >
+              <Activity className="w-4 h-4" />
             </button>
           </div>
         </div>
@@ -399,6 +439,7 @@ export default function VocalisDashboard() {
         onSelect={(id, name) => { setActiveModel({ id, name }); switchModel(id); setTimeout(() => setIsModelSettingsOpen(false), 600); }}
       />
       <LogViewer />
+      <SystemMonitor isOpen={isSystemMonitorOpen} onClose={() => setIsSystemMonitorOpen(false)} />
     </main>
   );
 }

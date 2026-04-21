@@ -9,6 +9,11 @@ os.environ["PYTHONFPEMASK"] = "1"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 os.environ["NPY_DISABLE_CPU_FEATURES"] = "AVX512F"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# Strict cuBLAS determinism — MUST be set before torch is imported,
+# otherwise torch.use_deterministic_algorithms(True) raises at call time.
+# Required so repeated diffusion sampling of the same text produces the
+# same audio (no pitch drift across turns).
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 # -------------------------------------------------------------
 
 import asyncio
@@ -32,13 +37,37 @@ import uuid
 import shutil
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 try:
     from web_backend.engine import WebAssistant, _models
 except ImportError:
     from engine import WebAssistant, _models
+
+try:
+    from web_backend.llm_providers import (
+        resolve_provider, ollama_unload_all, ollama_warmup, save_provider_config,
+    )
+except ImportError:
+    from llm_providers import (
+        resolve_provider, ollama_unload_all, ollama_warmup, save_provider_config,
+    )
+
+try:
+    from web_backend.stt_providers import (
+        resolve_stt, build_stt, save_stt_config,
+    )
+except ImportError:
+    from stt_providers import (
+        resolve_stt, build_stt, save_stt_config,
+    )
+
+try:
+    from web_backend.campaigns import load_campaign, save_campaign
+except ImportError:
+    from campaigns import load_campaign, save_campaign
 
 try:
     from web_backend.audio_utils import trim_audio_file
@@ -159,59 +188,101 @@ async def lifespan(app):
     print("[Startup] Pre-loading AI models...")
     _models.load()
 
-    # Prewarm Ollama with FULL GPU offload (num_gpu=99). The model is already
-    # resident in RTX 3060 VRAM (4.3 GB); this call makes inference use the GPU
-    # for computation, cutting TTFT from ~400 ms (CPU) to ~100 ms (GPU).
-    # num_ctx=1024 keeps the KV cache small (~128 MB) so we don't OOM the
-    # remaining 256 MB of free VRAM on RTX 3060.
-    print("[Startup] Pre-warming Ollama on GPU (num_gpu=99, num_ctx=1024)...")
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            await client.post("http://127.0.0.1:11434/api/generate", json={
-                "model": "gemma3:4b",
-                "prompt": "test",
-                "stream": False,
-                "options": {"num_predict": 1, "num_gpu": 99, "num_ctx": 1024}
-            })
-        print("[Startup] Ollama pre-warmed on GPU.")
-    except Exception as e:
-        print(f"[Startup] Ollama pre-warm skipped: {e}")
+    # Resolve the active LLM provider once at startup. Local Ollama gets a GPU
+    # prewarm; remote APIs (Sarvam) are HTTP-only so we skip all local warmup.
+    active_provider = resolve_provider()
+    print(f"[Startup] LLM provider: {active_provider.name} model={active_provider.model}")
 
-    # [OBS] Emit one-shot device manifest. Includes torch/ASR/TTS info captured
-    # by _ModelStore.load(), Ollama's actual VRAM split for the LLM (so we
-    # can confirm whether num_gpu=0 really kept it on CPU), and process info.
-    boot_manifest = dict(getattr(_models, "device_info", {}))
-    boot_manifest["llm_configured_num_gpu"] = 99
-    boot_manifest["llm_configured_num_ctx"] = 1024
-    boot_manifest["llm_model"] = "gemma3:4b"
-    boot_manifest["pid"] = os.getpid()
-    boot_manifest["windows_priority"] = _priority_class_set
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            ps_resp = await client.get("http://127.0.0.1:11434/api/ps")
-            ps_data = ps_resp.json() if ps_resp.status_code == 200 else {}
-        for m in ps_data.get("models", []) or []:
-            if m.get("name", "").startswith("gemma3:4b"):
-                size_total = int(m.get("size", 0) or 0)
-                size_vram = int(m.get("size_vram", 0) or 0)
-                if size_total > 0 and size_vram >= int(size_total * 0.9):
-                    actual = "cuda"
-                elif size_vram == 0:
-                    actual = "cpu"
-                else:
-                    actual = "mixed"
-                boot_manifest["llm_size_total_bytes"] = size_total
-                boot_manifest["llm_size_vram_bytes"] = size_vram
-                boot_manifest["llm_actual_device"] = actual
-                break
-    except Exception as e:
-        boot_manifest["llm_probe_error"] = f"{type(e).__name__}: {e}"[:200]
+    if active_provider.uses_local_gpu:
+        # Prewarm Ollama with FULL GPU offload (num_gpu=99). Cuts TTFT from
+        # ~400 ms (CPU) to ~100 ms (GPU). num_ctx=1024 keeps KV cache small.
+        print("[Startup] Pre-warming Ollama on GPU (num_gpu=99, num_ctx=1024)...")
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                await client.post("http://127.0.0.1:11434/api/generate", json={
+                    "model": active_provider.model,
+                    "prompt": "test",
+                    "stream": False,
+                    "options": {"num_predict": 1, "num_gpu": 99, "num_ctx": 1024}
+                })
+            print("[Startup] Ollama pre-warmed on GPU.")
+        except Exception as e:
+            print(f"[Startup] Ollama pre-warm skipped: {e}")
+    else:
+        # Active provider is remote (Sarvam). If ollama.exe is still running
+        # from a previous session (launcher skipped the taskkill, manual
+        # backend restart, etc.), it may be holding models in VRAM that
+        # OmniVoice now needs. Evict them proactively — no-op if Ollama isn't
+        # running, since the HTTP call just fails silently.
+        print(f"[Startup] Active provider is {active_provider.name}; evicting any resident Ollama models...")
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                unloaded = await ollama_unload_all(client)
+            if unloaded:
+                print(f"[Startup] Freed Ollama VRAM: {unloaded}")
+            else:
+                print("[Startup] No resident Ollama models to evict (or Ollama not running).")
+        except Exception as e:
+            print(f"[Startup] Ollama eviction skipped: {e}")
+
+    # [OBS] Emit one-shot device manifest.
+    boot_manifest = {
+        "llm_provider": active_provider.name,
+        "llm_model": active_provider.model,
+        "llm_url": active_provider.url,
+        "pid": os.getpid(),
+        "windows_priority": _priority_class_set
+    }
+    if active_provider.uses_local_gpu:
+        boot_manifest["llm_configured_num_gpu"] = 99
+        boot_manifest["llm_configured_num_ctx"] = 4096
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                ps_resp = await client.get("http://127.0.0.1:11434/api/ps")
+                ps_data = ps_resp.json() if ps_resp.status_code == 200 else {}
+            for m in ps_data.get("models", []) or []:
+                if m.get("name", "").startswith(active_provider.model):
+                    size_total = int(m.get("size", 0) or 0)
+                    size_vram = int(m.get("size_vram", 0) or 0)
+                    if size_total > 0 and size_vram >= int(size_total * 0.9):
+                        actual = "cuda"
+                    elif size_vram == 0:
+                        actual = "cpu"
+                    else:
+                        actual = "mixed"
+                    boot_manifest["llm_size_total_bytes"] = size_total
+                    boot_manifest["llm_size_vram_bytes"] = size_vram
+                    boot_manifest["llm_actual_device"] = actual
+                    break
+        except Exception as e:
+            boot_manifest["llm_probe_error"] = f"{type(e).__name__}: {e}"[:200]
+    else:
+        boot_manifest["llm_actual_device"] = "remote-api"
+
     try:
         await broadcast_log("BOOT", json.dumps(boot_manifest, ensure_ascii=False))
     except Exception as e:
         print(f"[Startup] BOOT log emit failed: {e}")
 
+    # Resolve STT provider. Default is sarvam (cloud) — Whisper only loads
+    # when explicitly selected. Running a single big GPU model (OmniVoice)
+    # instead of two is what keeps the CUDA allocator clean enough for
+    # cuDNN to pick consistent conv kernels turn-to-turn, which is what
+    # was causing the inter-turn pitch drift before.
+    stt_choice = resolve_stt()
+    print(f"[Startup] STT provider: {stt_choice.name} model={stt_choice.model}")
+    if stt_choice.uses_local_gpu:
+        _models.load_whisper(stt_choice.model)
+    app.state.stt_choice = stt_choice
+    app.state.stt_client = build_stt(stt_choice, whisper_model=_models.asr_model)
+
     # 2. Start Asterisk Bridge as a background task
+    app.state.llm_provider = active_provider
+    # Prime the campaign cache once at boot so the very first turn of the day
+    # doesn't pay the disk read. Missing/invalid campaigns.json returns {}
+    # and `build_system_prompt` falls back to a safe generic assistant prompt.
+    app.state.campaign = load_campaign()
+    print(f"[Startup] Campaign loaded: label={app.state.campaign.get('label')!r} candidate={app.state.campaign.get('candidate_name')!r}")
     app.state.bridge = VaaniAsteriskBridge(log_handler=broadcast_log)
     bridge_task = asyncio.create_task(app.state.bridge.run())
     print("[Startup] Asterisk Bridge initialized.")
@@ -396,14 +467,354 @@ async def get_voices():
 
 @app.get("/models/llm")
 async def get_llm_models():
-    """Returns a list of available LLM models for the settings UI."""
-    # These match the models we verified are installed in your Ollama
+    """Returns a list of available LLM models for the settings UI.
+
+    The list is provider-dependent: local Ollama exposes the GGUF models we've
+    verified, remote Sarvam exposes the Indic tiers from their API docs.
+    """
+    # Prefer the live, possibly-switched provider over the env-resolved one so
+    # the UI reflects post-/provider/switch state instead of boot-time state.
+    provider = getattr(app.state, "llm_provider", None) or resolve_provider()
+    if provider.name == "sarvam":
+        return [
+            {"id": "sarvam-m",    "name": "Sarvam M (24B) - Average"},
+            {"id": "sarvam-30b",  "name": "Sarvam 30B - High IQ"},
+            {"id": "sarvam-105b", "name": "Sarvam 105B - Flagship"},
+        ]
     return [
         {"id": "gemma3:4b", "name": "Gemma 3 (4B) - Default"},
         {"id": "qwen2:7b", "name": "Qwen 2 (7B) - High IQ"},
         {"id": "gemma4:e4b", "name": "Gemma 4 (Large)"},
         {"id": "mashriram/sarvam-m:latest", "name": "Sarvam (M-Hinglish)"}
     ]
+
+def _read_nvidia_smi():
+    """Snapshot all visible NVIDIA GPUs. Returns [] if nvidia-smi isn't on PATH
+    or the call fails — the frontend handles an empty list gracefully."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2
+        )
+    except Exception:
+        return []
+    gpus = []
+    for line in (out.stdout or "").strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 6:
+            continue
+        def _num(v, cast=int, default=0):
+            try:
+                return cast(v)
+            except Exception:
+                return default
+        gpus.append({
+            "index":        _num(parts[0]),
+            "name":         parts[1],
+            "util_pct":     _num(parts[2]),
+            "mem_used_mb":  _num(parts[3]),
+            "mem_total_mb": _num(parts[4]),
+            "temp_c":       _num(parts[5]),
+            "power_w":      _num(parts[6], cast=float, default=0.0) if len(parts) > 6 else 0.0,
+            "power_limit_w":_num(parts[7], cast=float, default=0.0) if len(parts) > 7 else 0.0,
+        })
+    return gpus
+
+
+async def _ollama_loaded_models():
+    """Ask Ollama which models are currently resident in GPU memory. Best-effort —
+    timeouts and non-200s just yield []."""
+    try:
+        async with httpx.AsyncClient(timeout=1.5) as client:
+            r = await client.get("http://127.0.0.1:11434/api/ps")
+            if r.status_code == 200:
+                return [
+                    {
+                        "name": m.get("name"),
+                        "size_mb": int(m.get("size", 0) // (1024 * 1024)),
+                        "vram_mb": int(m.get("size_vram", 0) // (1024 * 1024)),
+                    }
+                    for m in r.json().get("models", [])
+                ]
+    except Exception:
+        pass
+    return []
+
+
+@app.get("/system/status")
+async def system_status():
+    """Live snapshot of GPUs + loaded models for the frontend monitor panel.
+    Polled by the UI at ~1.5s cadence; keep the work light."""
+    provider = getattr(app.state, "llm_provider", None)
+    gpus = _read_nvidia_smi()
+    ollama_models = await _ollama_loaded_models() if (provider and getattr(provider, "name", "") == "ollama") else []
+
+    # Pin assignments are defined by the launcher: STT on cuda:1 (GTX 1650),
+    # TTS + LLM on cuda:0 (RTX 3060). If someone reshuffles CUDA_VISIBLE_DEVICES,
+    # this will drift, but it mirrors start_vaani_web.py's current pinning.
+    stt_device = "cuda:0"  # WhisperModel(..., device_index=0) in engine.py
+    tts_device = "cuda:0"  # OmniVoice loads on cuda:0
+    llm_device = "cuda:0" if (provider and getattr(provider, "uses_local_gpu", False)) else "remote"
+
+    models = {
+        "stt": {
+            "name": "faster-whisper large-v3-turbo",
+            "device": stt_device,
+            "loaded": bool(getattr(_models, "asr_model", None)),
+            "role": "Speech-to-Text",
+        },
+        "tts": {
+            "name": "OmniVoice",
+            "device": tts_device,
+            "loaded": bool(getattr(_models, "tts_model", None)),
+            "role": "Text-to-Speech",
+        },
+        "llm": {
+            "name": (provider.model if provider else "unknown"),
+            "provider": (getattr(provider, "name", "unknown") if provider else "unknown"),
+            "device": llm_device,
+            "url": (provider.url if provider else ""),
+            "loaded": True if (provider and not getattr(provider, "uses_local_gpu", False)) else bool(ollama_models),
+            "role": "Language Model",
+            "resident_models": ollama_models,
+        },
+    }
+
+    active_calls = 0
+    try:
+        if hasattr(app.state, "bridge"):
+            active_calls = len(app.state.bridge.sessions)
+    except Exception:
+        pass
+
+    return {
+        "ts": time.time(),
+        "gpus": gpus,
+        "models": models,
+        "active_calls": active_calls,
+    }
+
+
+@app.post("/ollama/unload")
+async def force_unload_ollama():
+    """Manual escape hatch: evict every known Ollama model from GPU regardless
+    of the currently-active provider. The System Monitor panel calls this when
+    the user explicitly wants VRAM back (e.g. Sarvam is active but Ollama
+    didn't get freed during the switch)."""
+    async with httpx.AsyncClient() as client:
+        unloaded = await ollama_unload_all(client)
+    print(f"[Ollama] Force-unload requested: {unloaded}", flush=True)
+    return {"ok": True, "unloaded": unloaded}
+
+
+class ProviderSwitchBody(BaseModel):
+    provider: str            # "ollama" | "sarvam"
+    model: str | None = None
+
+
+@app.post("/provider/switch")
+async def switch_provider(body: ProviderSwitchBody, request: Request):
+    """Hot-swap the active LLM backend.
+
+    Contract:
+      - Switching AWAY from ollama: evict all known Ollama tags from GPU via
+        keep_alive=0 so VRAM comes back to OmniVoice.
+      - Switching TO ollama: resolve first, then warm the chosen model so the
+        first real turn isn't cold.
+      - If the target provider matches what's already active, this is a no-op:
+        prevents the "accidentally clicked my own provider" UX from wiping the
+        persisted model (was defaulting to gemma3:4b on any bare Ollama POST).
+      - On failure (e.g. Sarvam key missing), the active provider is left
+        untouched — the UI shouldn't end up pointing at a broken backend.
+    """
+    new_name = (body.provider or "").lower().strip()
+    if new_name not in ("ollama", "sarvam"):
+        raise HTTPException(status_code=400, detail=f"unknown provider {new_name!r}")
+
+    prev = getattr(app.state, "llm_provider", None)
+    prev_name = getattr(prev, "name", None)
+    prev_model = getattr(prev, "model", None)
+
+    # Diagnostic: who triggered this? Unexpected flips have been observed; log
+    # UA + referer so we can pin it to a component if it recurs.
+    ua = request.headers.get("user-agent", "?")[:100]
+    ref = request.headers.get("referer", "-")[:80]
+    origin = request.headers.get("origin", "-")[:80]
+    print(f"[Provider] /switch request prev={prev_name}/{prev_model} "
+          f"target={new_name}/{body.model} origin={origin} referer={ref} ua={ua}",
+          flush=True)
+
+    # No-op guard: same provider + same model (or unspecified model) means the
+    # caller didn't actually want to change anything. Just return the current
+    # state so a stray click doesn't trigger an Ollama warmup + VRAM reload.
+    if new_name == prev_name and (body.model is None or body.model == prev_model):
+        print(f"[Provider] /switch no-op (already {prev_name}/{prev_model})", flush=True)
+        return {
+            "ok": True,
+            "provider": prev_name,
+            "model": prev_model,
+            "unloaded": [],
+            "warmed": None,
+            "noop": True,
+        }
+
+    # Resolve target first so a bad config (missing SARVAM_API_KEY, etc.)
+    # fails fast without touching GPU state.
+    try:
+        new_provider = resolve_provider(override_name=new_name, override_model=body.model)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    unloaded: list[str] = []
+    warmed: bool | None = None
+    async with httpx.AsyncClient() as client:
+        if prev_name == "ollama" and new_name != "ollama":
+            unloaded = await ollama_unload_all(client)
+            print(f"[Provider] Unloaded Ollama models: {unloaded}", flush=True)
+        app.state.llm_provider = new_provider
+        print(f"[Provider] Switched {prev_name} -> {new_name} (model={new_provider.model})", flush=True)
+        # Persist so the next boot starts here without the user re-switching
+        # and, crucially, so the launcher skips Ollama startup when Sarvam is
+        # the active backend (saves ~3GB of VRAM for OmniVoice).
+        if save_provider_config(new_provider.name, new_provider.model):
+            print(f"[Provider] Persisted choice -> provider_config.json", flush=True)
+        if new_name == "ollama":
+            # Warm on the way in so the next voice turn doesn't pay cold-load.
+            warmed = await ollama_warmup(client, new_provider.model)
+            print(f"[Provider] Ollama warmup ({new_provider.model}) -> {warmed}", flush=True)
+
+    return {
+        "ok": True,
+        "provider": new_provider.name,
+        "model": new_provider.model,
+        "unloaded": unloaded,
+        "warmed": warmed,
+    }
+
+
+@app.get("/stt/status")
+async def get_stt_status():
+    """Report the active STT backend. Used by the UI to show which one is
+    driving transcription and to render the toggle state."""
+    choice = getattr(app.state, "stt_choice", None)
+    whisper_loaded = getattr(_models, "asr_model", None) is not None
+    return {
+        "provider": getattr(choice, "name", None),
+        "model": getattr(choice, "model", None),
+        "whisper_loaded": whisper_loaded,
+    }
+
+
+class STTSwitchBody(BaseModel):
+    provider: str                 # "sarvam" | "whisper"
+    model: Optional[str] = None
+
+
+@app.post("/stt/switch")
+async def switch_stt(body: STTSwitchBody, request: Request):
+    """Switch the STT backend at runtime.
+
+    - sarvam → whisper: lazy-loads faster-whisper onto cuda:0 on first use.
+    - whisper → sarvam: frees the Whisper GPU weights so OmniVoice gets the
+      full, clean allocator back. This is what the pitch-drift fix hinged on.
+    - Same-provider no-op short-circuits so a stray click doesn't thrash
+      VRAM.
+    """
+    new_name = (body.provider or "").lower().strip()
+    if new_name not in ("sarvam", "whisper"):
+        raise HTTPException(status_code=400, detail=f"unknown STT provider {new_name!r}")
+
+    prev = getattr(app.state, "stt_choice", None)
+    prev_name = getattr(prev, "name", None)
+    prev_model = getattr(prev, "model", None)
+
+    ua = request.headers.get("user-agent", "?")[:100]
+    print(f"[STT] /switch request prev={prev_name}/{prev_model} "
+          f"target={new_name}/{body.model} ua={ua}", flush=True)
+
+    if new_name == prev_name and (body.model is None or body.model == prev_model):
+        print(f"[STT] /switch no-op (already {prev_name}/{prev_model})", flush=True)
+        return {"ok": True, "provider": prev_name, "model": prev_model, "noop": True}
+
+    try:
+        new_choice = resolve_stt(override_name=new_name, override_model=body.model)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Close the previous client cleanly (Sarvam holds an httpx.AsyncClient).
+    prev_client = getattr(app.state, "stt_client", None)
+
+    if new_choice.uses_local_gpu:
+        # Load Whisper now so the first utterance isn't a cold-load gamble.
+        _models.load_whisper(new_choice.model)
+    else:
+        # Switching to Sarvam — free Whisper's VRAM so OmniVoice runs on a
+        # clean allocator again.
+        _models.unload_whisper()
+
+    new_client = build_stt(new_choice, whisper_model=_models.asr_model)
+    app.state.stt_choice = new_choice
+    app.state.stt_client = new_client
+
+    if prev_client is not None and prev_client is not new_client:
+        try:
+            await prev_client.aclose()
+        except Exception:
+            pass
+
+    if save_stt_config(new_choice.name, new_choice.model):
+        print(f"[STT] Persisted choice -> stt_config.json", flush=True)
+
+    return {"ok": True, "provider": new_choice.name, "model": new_choice.model}
+
+
+@app.get("/campaign")
+async def get_campaign():
+    """Return the currently active campaign config. Cached on app.state so
+    repeated GETs don't hit disk; the cache is primed at startup and refreshed
+    on PUT."""
+    cached = getattr(app.state, "campaign", None)
+    if cached is None:
+        cached = load_campaign()
+        app.state.campaign = cached
+    return cached or {}
+
+
+@app.put("/campaign")
+async def put_campaign(body: dict):
+    """Replace the active campaign config. Persists to campaigns.json and
+    updates the in-memory cache so the next LLM turn picks up the new prompt
+    without a WebSocket reconnect."""
+    if not isinstance(body, dict) or not body:
+        raise HTTPException(status_code=400, detail="campaign body must be a non-empty object")
+    try:
+        save_campaign(body, name="default")
+        app.state.campaign = body
+        print(f"[Campaign] updated: label={body.get('label')!r} candidate={body.get('candidate_name')!r}", flush=True)
+        return {"ok": True, "campaign": body}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"save failed: {e}")
+
+
+@app.post("/debug/ws_close")
+async def debug_ws_close(payload: dict):
+    """Browser posts the WebSocket close event here so we can log it in backend.log.
+
+    Lets us see the close-code from the browser's perspective, which the server
+    doesn't otherwise know (it just sees "websocket.disconnect").
+    """
+    code = payload.get("code")
+    reason = payload.get("reason")
+    was_clean = payload.get("wasClean")
+    ts = payload.get("ts")
+    print(f"[FE-WS-CLOSE] code={code} reason={reason!r} wasClean={was_clean} ts={ts}")
+    return {"ok": True}
 
 @app.post("/voices/upload")
 async def upload_voice(
@@ -629,7 +1040,28 @@ async def websocket_endpoint(websocket: WebSocket):
     voices = load_voices()
     initial_voice = next((v for v in voices if v["id"] == initial_voice_id), None)
 
-    assistant = WebAssistant(event_handler=event_handler)
+    provider = getattr(app.state, 'llm_provider', None)
+    # Per-turn provider read so /provider/switch takes effect mid-session.
+    def _current_provider():
+        return getattr(app.state, 'llm_provider', None)
+    # Per-turn campaign read so /campaign edits take effect on next user turn.
+    def _current_campaign():
+        cached = getattr(app.state, 'campaign', None)
+        return cached if cached is not None else load_campaign()
+    # Per-turn STT read so /stt/switch flips sarvam<->whisper without
+    # reopening the socket. asr_worker calls this before each transcription.
+    def _current_stt():
+        return getattr(app.state, 'stt_client', None)
+    assistant = WebAssistant(
+        event_handler=event_handler,
+        llm_url=provider.url if provider else None,
+        llm_model=provider.model if provider else None,
+        llm_headers=provider.headers() if provider else None,
+        llm_extras=provider.payload_extras() if provider else None,
+        get_provider=_current_provider,
+        get_campaign=_current_campaign,
+        get_stt=_current_stt,
+    )
     
     if initial_voice:
         # Use .get() for every field — voices.json is user-edited and some entries
@@ -684,6 +1116,13 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             message = await websocket.receive()
             if message.get("type") == "websocket.disconnect":
+                 # Print exact close code + reason so we can tell server-initiated
+                 # (ping timeout → 1011) from client-initiated (1000 normal,
+                 # 1001 going-away, 1006 abnormal) closes. Turn 'connection closed'
+                 # from uvicorn into something actionable.
+                 code = message.get("code")
+                 reason = message.get("reason")
+                 print(f"[WS] disconnect msg code={code} reason={reason!r} is_speaking={assistant.is_speaking} tts_qsize={assistant.tts_queue.qsize()} llm_qsize={assistant.llm_queue.qsize()}")
                  break
             if "bytes" in message:
                 raw = message["bytes"]
@@ -705,9 +1144,25 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif data.get("type") == "switch_model":
                     new_model = data.get("model_id")
                     if new_model:
-                        print(f"[WS] Switching model to: {new_model}")
-                        assistant.llm_model = new_model
-                        await websocket.send_json({"type": "status", "data": f"Model switched to {new_model}"})
+                        # Go through resolve_provider so the new model inherits
+                        # the current provider's URL, auth, and payload extras
+                        # — otherwise assistant.llm_model drifts away from
+                        # app.state.llm_provider and /system/status reports the
+                        # wrong value on UI refresh.
+                        current = getattr(app.state, "llm_provider", None) or resolve_provider()
+                        try:
+                            new_provider = resolve_provider(
+                                override_name=current.name,
+                                override_model=new_model,
+                            )
+                        except Exception as e:
+                            await websocket.send_json({"type": "status", "data": f"Model switch failed: {e}"})
+                        else:
+                            app.state.llm_provider = new_provider
+                            assistant.llm_model = new_model
+                            save_provider_config(new_provider.name, new_provider.model)
+                            print(f"[WS] switch_model -> provider={new_provider.name} model={new_model} (persisted)", flush=True)
+                            await websocket.send_json({"type": "status", "data": f"Model switched to {new_model}"})
 
                 elif data.get("type") == "reset_chat":
                     print(f"[WS] Resetting chat session and memory")
@@ -755,17 +1210,16 @@ async def websocket_endpoint(websocket: WebSocket):
                             await websocket.send_json({"type": "status", "data": f"Error switching voice: {str(e)}"})
 
     except WebSocketDisconnect:
-        print("[WS] Client disconnected.")
+        print("[WS] Client disconnected.", flush=True)
     except Exception as e:
-        print(f"[WS] Error: {e}")
+        import traceback
+        print(f"[WS] Error: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
     finally:
-        # [OBS] Emit per-session aggregate (turn count + p50/p95 of every stage).
-        try:
-            await broadcast_log("SESSION-END", json.dumps(assistant.session_summary(), ensure_ascii=False))
-        except Exception as e:
-            print(f"[WS] session_summary emit failed: {e}")
+        print(f"[WS] Entering finally. engine_task.done={engine_task.done()} is_running={assistant.is_running}", flush=True)
         assistant.stop()
         engine_task.cancel()
+        print(f"[WS] After cancel: engine_task.done={engine_task.done()} cancelled={engine_task.cancelled()}", flush=True)
 
 @app.websocket("/ws/openai")
 async def openai_realtime(websocket: WebSocket):

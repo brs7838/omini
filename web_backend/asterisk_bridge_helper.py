@@ -61,6 +61,7 @@ class AsteriskCallSession:
         self.rtp_ts = random.randint(10000, 50000)
         self.rtp_buffer = bytearray()
         self.rtp_buffer_count = 0
+        self.ai_audio_queue = asyncio.Queue()
         self.transport = None
         self.protocol = None
         
@@ -76,6 +77,7 @@ class AsteriskCallSession:
         self._rtp_in_count = 0
         self._rtp_in_last_ts = time.time()
         self._rtp_tracer_task = None
+        self._playback_task = None
         # RMS tracking for the inbound tracer — sum of per-packet RMS, divided
         # by count to get the average signal level during each 5s window.
         self._rtp_rms_sum = 0.0
@@ -193,13 +195,29 @@ class AsteriskCallSession:
                 print(f"[Call {self.channel_id}] Channels bridged: {resp2.status_code}", flush=True)
 
                 # [Phase 17] START HEARTBEAT IMMEDIATELY
-                # Send silence immediately to "warm up" the gateway and prevent auto-reject.
                 self._heartbeat_task = asyncio.create_task(self._run_heartbeat())
                 self._rtp_tracer_task = asyncio.create_task(self._run_rtp_tracer())
+                self._playback_task = asyncio.create_task(self._run_rtp_playback())
 
             # 5. Initialize Vaani Assistant (shared models)
             print(f"[Call {self.channel_id}] Initializing AI assistant...", flush=True)
-            self.assistant = WebAssistant(event_handler=self.on_ai_event, input_sampling_rate=8000)
+            provider = getattr(self.bridge_app.state, 'llm_provider', None)
+            # Per-turn callbacks so a mid-call /provider/switch or /campaign
+            # edit applies to the next user turn without dropping the call.
+            def _cur_provider():
+                return getattr(self.bridge_app.state, 'llm_provider', None)
+            def _cur_campaign():
+                return getattr(self.bridge_app.state, 'campaign', None)
+            self.assistant = WebAssistant(
+                event_handler=self.on_ai_event,
+                llm_url=provider.url if provider else None,
+                llm_model=provider.model if provider else None,
+                llm_headers=provider.headers() if provider else None,
+                llm_extras=provider.payload_extras() if provider else None,
+                get_provider=_cur_provider,
+                get_campaign=_cur_campaign,
+                input_sampling_rate=8000,  # Correct for Telephony
+            )
             self.assistant.reset_session() # Reset session clock and state
             print(f"[Call {self.channel_id}] AI assistant ready.", flush=True)
 
@@ -331,83 +349,62 @@ class AsteriskCallSession:
 
     async def on_ai_event(self, msg_type, data):
         """Handle events from WebAssistant."""
+    async def _run_rtp_playback(self):
+        """Dedicated task to drain ai_audio_queue and send RTP frames with precise pacing."""
+        print(f"[Call {self.channel_id}] Playback task started.", flush=True)
+        while self.is_active:
+            try:
+                data = await self.ai_audio_queue.get()
+                
+                # Offload heavy audio processing (decimation, conversion) to a thread
+                def process_audio(raw_data):
+                    # 1. From 24kHz Native to Float
+                    audio_24k = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
+                    
+                    # 2. Proper polyphase downsample 24k -> 8k.
+                    if len(audio_24k) >= 3:
+                        audio_8k = signal.resample_poly(audio_24k, 1, 3).astype(np.float32)
+                    else:
+                        audio_8k = audio_24k[::3]
+                    
+                    # 3. Convert 16-bit PCM Linear to Big-Endian (Standard L16)
+                    # Apply 2.0x POWER GAIN for telephony clarity
+                    return (np.clip(audio_8k * 2.5, -1, 1) * 32767).astype('>i2').tobytes()
+
+                pcm_8k = await asyncio.to_thread(process_audio, data)
+
+                if self.transport and self.peer_addr:
+                    # [Phase 20] Send as 20ms RTP frames
+                    FRAME_BYTES = 320 
+                    frames_sent = 0
+                    session_start_time = time.perf_counter()
+                    
+                    for i in range(0, len(pcm_8k), FRAME_BYTES):
+                        if not self.is_active: break
+                        frame = pcm_8k[i:i + FRAME_BYTES]
+                        if len(frame) < FRAME_BYTES:
+                            frame += b'\x00' * (FRAME_BYTES - len(frame))
+                        
+                        self.send_rtp_frame(frame)
+                        frames_sent += 1
+                        
+                        expected_elapsed = (frames_sent * 0.020)
+                        while (time.perf_counter() - session_start_time) < expected_elapsed:
+                            await asyncio.sleep(0.001)
+                    
+                    self._last_ai_audio_time = time.time()
+                self.ai_audio_queue.task_done()
+            except Exception as e:
+                print(f"[Call {self.channel_id}] Playback error: {e}", flush=True)
+                await asyncio.sleep(0.1)
+
+    async def on_ai_event(self, msg_type, data):
+        """Handle events from WebAssistant."""
         if msg_type == "audio_chunk":
             if not self.is_active:
                 return
-            # Offload heavy audio processing (decimation, conversion) to a thread
-            def process_audio(raw_data):
-                # 1. From 24kHz Native to Float
-                audio_24k = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
-                
-                # 2. Improved Resampling: Avoid aliasing noise by using a 3-tap mean filter
-                # (Simple but effective for 24k -> 8k conversion)
-                if len(audio_24k) >= 3:
-                    # Pad to make it divisible by 3
-                    n = len(audio_24k)
-                    trimmed = audio_24k[:n - (n % 3)]
-                    audio_8k = trimmed.reshape(-1, 3).mean(axis=1)
-                else:
-                    audio_8k = audio_24k[::3]
-                
-                # 3. Convert 16-bit PCM Linear to Big-Endian (Standard L16)
-                # Apply 2.0x POWER GAIN for telephony clarity (Standard for noisy analog links)
-                return (np.clip(audio_8k * 2.0, -1, 1) * 32767).astype('>i2').tobytes()
-
-            pcm_8k = await asyncio.to_thread(process_audio, data)
-
-            # [STABILITY] Skip wait if peer_addr was proactively learned from ARI
-            if self.peer_addr:
-                pass 
-            else:
-                print(f"[Call {self.channel_id}] No peer_addr yet. Waiting for Asterisk to wake up...")
-                for _ in range(250):  # Wait up to 5 seconds for the first packet
-                    if self.peer_addr or not self.is_active:
-                        break
-                    await asyncio.sleep(0.02)
-
-            if self.transport and self.peer_addr:
-                # [Phase 20] Send as 20ms RTP frames for Crystal Clarity
-                # 20ms @ 8kHz = 160 samples = 320 bytes
-                FRAME_BYTES = 320 
-                frames_sent = 0
-                
-                session_start_time = time.perf_counter()
-                
-                for i in range(0, len(pcm_8k), FRAME_BYTES):
-                    if not self.is_active: break
-                    frame = pcm_8k[i:i + FRAME_BYTES]
-                    if len(frame) < FRAME_BYTES:
-                        frame += b'\x00' * (FRAME_BYTES - len(frame))
-                    
-                    rtp_packet = self._build_rtp_packet(frame)
-                    
-                    try:
-                        self.transport.sendto(rtp_packet, self.peer_addr)
-                        frames_sent += 1
-                    except Exception: break
-                    
-                    # Precise Pacing: 20ms per frame (matches FRAME_BYTES=320 @ 8kHz)
-                    expected_elapsed = (frames_sent * 0.020)
-                    
-                    while True:
-                        actual_elapsed = time.perf_counter() - session_start_time
-                        remaining = expected_elapsed - actual_elapsed
-                        if remaining > 0.005: 
-                            await asyncio.sleep(remaining - 0.002)
-                        else: break
-                    
-                    while (time.perf_counter() - session_start_time) < expected_elapsed:
-                        pass
-                
-                # Update last audio time to suppress heartbeat
-                self._last_ai_audio_time = time.time()
-                
-                if frames_sent > 0:
-                    print(f"[Call {self.channel_id}] Sent {frames_sent} 40ms RTP frames (Phase 8 Robust).", flush=True)
-            elif not self.peer_addr:
-                print(f"[Call {self.channel_id}] WARNING: No peer_addr after wait, audio DROPPED ({len(pcm_8k)} bytes)")
-            else:
-                print(f"[Call {self.channel_id}] WARNING: No transport, audio dropped")
+            # [NON-BLOCKING] Push to queue to unblock engine's tts_worker
+            self.ai_audio_queue.put_nowait(data)
         elif msg_type == "transcript":
             role = data['role'].upper()
             text = data['text']
@@ -436,6 +433,8 @@ class AsteriskCallSession:
             self._rtp_tracer_task.cancel()
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
+        if hasattr(self, '_playback_task'):
+            self._playback_task.cancel()
 
         if self.transport:
             self.transport.close()
