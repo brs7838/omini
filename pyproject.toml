@@ -103,6 +103,14 @@ constraint-dependencies = [
     "torchaudio==2.8.0",
 ]
 
+[tool.pyrefly]
+# Use the project venv so third-party packages (torch, fastapi, httpx, etc.)
+# resolve and don't generate virtual-stub warnings.
+python_interpreter = ".venv/Scripts/python.exe"
+# web_backend/ contains local modules imported directly by name
+# (campaigns, stt_providers, etc.).
+search_path = ["web_backend"]
+
 [tool.hatch.build.targets.sdist]
 include = ["omnivoice"]
 

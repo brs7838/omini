@@ -4,17 +4,15 @@ import VocalisOrb from "@/components/VocalisOrb";
 import Starfield from "@/components/Starfield";
 import Sidebar, { ChatSession } from "@/components/Sidebar";
 import { useVoice } from "@/hooks/useVoice";
-import { Mic, MicOff, Settings2, ArrowLeft, Sparkles } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import { useState, useRef, useEffect, useCallback, useSyncExternalStore } from "react";
+import { useState, useRef, useEffect, useCallback, useSyncExternalStore, useMemo } from "react";
 import VoiceLibrary from "@/components/VoiceLibrary";
-import LogViewer from "@/components/LogViewer";
-import Dialer from "@/components/Dialer";
-import CallHistory from "@/components/CallHistory";
 import ModelSettings from "@/components/ModelSettings";
-import SystemMonitor from "@/components/SystemMonitor";
+import TelephonyBento from "@/components/TelephonyBento";
+import TelemetryBento from "@/components/TelemetryBento";
 import SttChip from "@/components/SttChip";
-import { Phone, History, Activity } from "lucide-react";
+import { Mic, MicOff, Settings2, ArrowLeft, Sparkles, Send, Layers } from "lucide-react";
+import CampaignManager from "@/components/CampaignManager";
 
 interface VoiceMeta { id: string; name: string }
 
@@ -63,15 +61,19 @@ const AMBIENT: Record<string, string> = {
 
 export default function VocalisDashboard() {
   const [activeVoiceId, setActiveVoiceId] = useState("ravi");
-  const { state, messages, isLive, toggleLive, switchVoice, switchModel, resetChat } =
+  const { state, messages, isLive, isMicMuted, toggleLive, toggleMic, switchVoice, switchModel, resetChat, sendText } =
     useVoice(activeVoiceId);
+  const [chatInput, setChatInput] = useState("");
+  const [phoneMessages, setPhoneMessages] = useState<{role:"user"|"ai"; text:string}[]>([]);
+  const handlePhoneMessage = useCallback((msg: {role:"user"|"ai"; text:string}) => {
+    setPhoneMessages(prev => [...prev, msg]);
+  }, []);
 
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isVoiceLibraryOpen, setIsVoiceLibraryOpen]   = useState(false);
-  const [isDialerOpen,       setIsDialerOpen]          = useState(false);
-  const [isHistoryOpen,      setIsHistoryOpen]          = useState(false);
   const [isModelSettingsOpen,setIsModelSettingsOpen]   = useState(false);
-  const [isSystemMonitorOpen,setIsSystemMonitorOpen]   = useState(false);
+  const [isCampaignManagerOpen, setIsCampaignManagerOpen] = useState(false);
+  const [activeCampaign, setActiveCampaign] = useState("default");
   const [activeModel, setActiveModel] = useState({ id: "gemma3:4b", name: "Gemma 3 (4B)" });
   const [voices, setVoices] = useState<VoiceMeta[]>([]);
 
@@ -131,8 +133,14 @@ export default function VocalisDashboard() {
     if (viewingSessionId === id) setViewingSessionId(null);
   }, [viewingSessionId]);
 
-  const viewingSession   = viewingSessionId ? sessions.find(s => s.id === viewingSessionId) ?? null : null;
-  const displayedMessages = viewingSession ? viewingSession.messages : messages;
+  const viewingSession = useMemo(() => 
+    viewingSessionId ? sessions.find(s => s.id === viewingSessionId) ?? null : null,
+    [viewingSessionId, sessions]
+  );
+  const displayedMessages = useMemo(() => 
+    viewingSession ? viewingSession.messages : [...messages, ...phoneMessages],
+    [viewingSession, messages, phoneMessages]
+  );
   const sidebarActiveId  = viewingSessionId ?? (messages.length > 0 ? liveSessionId : null);
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [displayedMessages]);
@@ -146,13 +154,18 @@ export default function VocalisDashboard() {
     let cancelled = false;
     Promise.all([
       fetch("http://127.0.0.1:8000/system/status").then(r => r.ok ? r.json() : null).catch(() => null),
-      fetch("http://127.0.0.1:8000/models/llm").then(r => r.ok ? r.json() : []).catch(() => []),
-    ]).then(([status, listing]) => {
+      fetch("http://127.0.0.1:8000/models/llm").then(r => r.ok ? r.json() : []),
+      fetch("http://127.0.0.1:8000/campaign").then(r => r.ok ? r.json() : null).catch(() => null),
+    ]).then(([status, listing, campaign]) => {
       if (cancelled) return;
       const id = status?.models?.llm?.name;
-      if (!id) return;
-      const pretty = Array.isArray(listing) ? listing.find((m: { id: string; name: string }) => m.id === id) : null;
-      setActiveModel({ id, name: pretty?.name || id });
+      if (id) {
+        const pretty = Array.isArray(listing) ? listing.find((m: { id: string; name: string }) => m.id === id) : null;
+        setActiveModel({ id, name: pretty?.name || id });
+      }
+      if (campaign?.voice_id) {
+        setActiveVoiceId(campaign.voice_id);
+      }
     });
     return () => { cancelled = true; };
   }, []);
@@ -171,275 +184,248 @@ export default function VocalisDashboard() {
     voices.find(v => v.id === activeVoiceId)?.name ??
     (activeVoiceId === "ravi" ? "Ravi Sir" : activeVoiceId);
 
-  const handleDial = async (number: string) => {
-    try {
-      const r = await fetch("http://127.0.0.1:8000/calls/dial", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone_number: number, voice_id: activeVoiceId }),
-      });
-      if (r.ok) setIsHistoryOpen(true);
-    } catch { /* silent */ }
-  };
-
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <main className="flex h-screen bg-black text-white overflow-hidden font-sans selection:bg-emerald-500/30">
-      <Starfield />
-
       <Sidebar
         isCollapsed={isSidebarCollapsed}
         onToggle={() => setIsSidebarCollapsed(p => !p)}
         onNewChat={handleNewChat}
         onSettingsClick={() => setIsModelSettingsOpen(true)}
+        onCampaignClick={() => setIsCampaignManagerOpen(true)}
         sessions={visibleSessions}
         activeSessionId={sidebarActiveId}
         onSelectSession={handleSelectSession}
         onDeleteSession={handleDeleteSession}
       />
 
-      {/* ── Two-column main area ── */}
+      {/* ── BENTO DASHBOARD ── */}
       <motion.div
         animate={{ paddingLeft: isSidebarCollapsed ? 80 : 300 }}
         transition={{ duration: 0.3, ease: "easeInOut" }}
-        className="flex-1 flex h-full overflow-hidden"
+        className="flex-1 w-full h-full p-4 overflow-hidden"
       >
-        {/* ═══════════════════════════════════════
-            LEFT — Orb Panel
-        ═══════════════════════════════════════ */}
-        <div className="flex-1 flex flex-col items-center justify-center relative overflow-hidden">
+        <div className="w-full h-full flex flex-col lg:flex-row gap-4">
+          
+          {/* ═══════════════════════════════════════
+              LEFT BENTO — AI Canvas (Orb)
+          ═══════════════════════════════════════ */}
+          <div className="flex-[0.4] relative rounded-3xl bg-white/[0.02] border border-white/[0.05] overflow-hidden flex flex-col backdrop-blur-2xl">
+            <Starfield />
 
-          {/* Ambient background glow */}
-          <motion.div
-            key={state}
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            transition={{ duration: 1.2 }}
-            className="absolute inset-0 pointer-events-none"
-            style={{ background: AMBIENT[state] ?? AMBIENT.idle }}
-          />
+            {/* Ambient background glow */}
+            <motion.div
+              key={state}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ duration: 1.2 }}
+              className="absolute inset-0 pointer-events-none z-0"
+              style={{ background: AMBIENT[state] ?? AMBIENT.idle }}
+            />
 
-          {/* Orb */}
-          <div className="relative z-10 w-[34rem] h-[34rem] flex items-center justify-center">
-            <VocalisOrb state={state} />
-
-            {/* State badge — floats just below the orb centre */}
-            <div className="absolute bottom-6 left-1/2 -translate-x-1/2">
-              <AnimatePresence mode="wait">
-                <motion.div
-                  key={state}
-                  initial={{ opacity: 0, y: 6, scale: 0.9 }}
-                  animate={{ opacity: 1, y: 0,  scale: 1 }}
-                  exit={{ opacity: 0, y: -4, scale: 0.9 }}
-                  transition={{ duration: 0.2 }}
-                  className={`px-4 py-1.5 rounded-full text-[9px] font-extrabold tracking-[0.45em] uppercase border backdrop-blur-xl whitespace-nowrap ${
-                    state === "listening" ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400" :
-                    state === "speaking"  ? "bg-orange-500/10  border-orange-500/30  text-orange-400"  :
-                    state === "thinking"  ? "bg-indigo-500/10  border-indigo-500/30  text-indigo-400"  :
-                    state === "error"     ? "bg-red-500/10     border-red-500/30     text-red-400"     :
-                                           "bg-white/5        border-white/10       text-slate-500"
-                  }`}
+            {/* Top Controls */}
+            <div className="absolute top-4 inset-x-4 flex items-start justify-between z-20">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setIsVoiceLibraryOpen(true)}
+                  className="flex items-center gap-2 px-3 h-10 rounded-xl bg-black/40 border border-white/10 text-slate-300 hover:bg-black/60 hover:text-white transition-all backdrop-blur-md shadow-lg font-mono"
                 >
-                  {state}
-                </motion.div>
+                  <Settings2 className="w-3.5 h-3.5 text-emerald-500" />
+                  <span className="text-[10px] uppercase tracking-wider">{activeVoiceName}</span>
+                </button>
+                <SttChip />
+              </div>
+              <button
+                onClick={() => setIsModelSettingsOpen(true)}
+                className="flex items-center gap-2 px-3 h-10 rounded-xl bg-black/40 border border-white/10 text-slate-300 hover:bg-black/60 hover:text-white transition-all backdrop-blur-md shadow-lg font-mono"
+              >
+                <div className="p-0.5 bg-indigo-500/20 rounded-md">
+                  <Sparkles className="w-3 h-3 text-indigo-400" />
+                </div>
+                <span className="text-[10px] uppercase tracking-wider">{activeModel.name}</span>
+              </button>
+            </div>
+
+            {/* AI Orb */}
+            <div className="flex-1 flex items-center justify-center relative z-10">
+              <div className="w-[85%] h-[85%] flex items-center justify-center relative">
+                <VocalisOrb state={state} />
+                <div className="absolute bottom-16 left-1/2 -translate-x-1/2">
+                  <AnimatePresence mode="wait">
+                    <motion.div
+                      key={state}
+                      initial={{ opacity: 0, y: 6 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -4 }}
+                      transition={{ duration: 0.2 }}
+                      className={`px-3 py-1 rounded-md text-[9px] font-extrabold tracking-[0.45em] uppercase border backdrop-blur-xl whitespace-nowrap shadow-xl ${
+                        state === "listening" ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400" :
+                        state === "speaking"  ? "bg-orange-500/10 border-orange-500/30 text-orange-400"  :
+                        state === "thinking"  ? "bg-indigo-500/10 border-indigo-500/30 text-indigo-400"  :
+                        state === "error"     ? "bg-red-500/10 border-red-500/30 text-red-400"     :
+                        "bg-white/5 border-white/10 text-slate-500"
+                      }`}
+                    >
+                      {state}
+                    </motion.div>
+                  </AnimatePresence>
+                </div>
+              </div>
+            </div>
+
+            {/* Bottom Mic Row */}
+            <div className="absolute bottom-6 inset-x-0 flex justify-center items-center gap-6 z-20">
+              <button
+                onClick={() => {
+                  if (viewingSession) setViewingSessionId(null);
+                  toggleLive();
+                }}
+                className={`px-4 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all backdrop-blur-md shadow-lg border ${
+                  isLive
+                    ? "bg-red-500/10 text-red-400 border-red-500/20 hover:bg-red-500/20"
+                    : "bg-emerald-500/10 text-emerald-400 border-emerald-500/20 hover:bg-emerald-500/20"
+                }`}
+              >
+                {isLive ? "End Session" : "Start Live"}
+              </button>
+
+              <button
+                onClick={() => {
+                  if (viewingSession) setViewingSessionId(null);
+                  if (isLive) toggleMic();
+                }}
+                disabled={!isLive}
+                className={`relative w-14 h-14 rounded-full flex items-center justify-center border-2 transition-all duration-500 backdrop-blur-md shadow-[0_0_30px_rgba(0,0,0,0.5)] ${
+                  !isLive
+                    ? "opacity-50 cursor-not-allowed bg-white/5 border-white/10 text-white/50"
+                    : isMicMuted
+                    ? "bg-red-500/20 text-red-500 border-red-500/40"
+                    : "bg-white text-black border-transparent shadow-[0_0_30px_rgba(59,130,246,0.15)] hover:scale-105"
+                }`}
+              >
+                {!isLive || isMicMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+                {isLive && !isMicMuted && <span className="absolute inset-0 rounded-full animate-ping bg-white/30 pointer-events-none" />}
+              </button>
+            </div>
+            
+            {/* Inline Settings overlays inside the AI Cell */}
+            <div className="absolute inset-0 z-50 pointer-events-none">
+              <VoiceLibrary isOpen={isVoiceLibraryOpen} onClose={() => setIsVoiceLibraryOpen(false)} activeVoiceId={activeVoiceId} onSelect={(id) => { setActiveVoiceId(id); switchVoice(id); setTimeout(() => setIsVoiceLibraryOpen(false), 800); }} />
+              <ModelSettings isOpen={isModelSettingsOpen} onClose={() => setIsModelSettingsOpen(false)} activeModelId={activeModel.id} onSelect={(id, name) => { setActiveModel({ id, name }); switchModel(id); setTimeout(() => setIsModelSettingsOpen(false), 600); }} />
+              <CampaignManager 
+                isOpen={isCampaignManagerOpen} 
+                onClose={() => setIsCampaignManagerOpen(false)} 
+                activeCampaignName={activeCampaign} 
+                onSelect={(name, campaign) => { 
+                  setActiveCampaign(name); 
+                  if (campaign.voice_id) {
+                    setActiveVoiceId(campaign.voice_id);
+                    switchVoice(campaign.voice_id);
+                  }
+                  setTimeout(() => setIsCampaignManagerOpen(false), 600); 
+                }} 
+              />
+            </div>
+
+          </div>
+
+          {/* ═══════════════════════════════════════
+              MIDDLE BENTO — Conversation
+          ═══════════════════════════════════════ */}
+          <div className="flex-[0.3] rounded-3xl bg-[#0c0c0e] border border-white/[0.05] overflow-hidden shadow-2xl flex flex-col backdrop-blur-2xl relative">
+            {/* Header */}
+            <div className="shrink-0 px-5 pt-4 pb-3 z-20 border-b border-white/5 bg-white/[0.02]">
+              <AnimatePresence mode="wait">
+                {viewingSession ? (
+                  <motion.div key="history" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex items-center gap-2">
+                    <button onClick={() => setViewingSessionId(null)} className="p-1.5 rounded-lg hover:bg-white/10 text-slate-500 hover:text-white transition-colors">
+                      <ArrowLeft className="w-3.5 h-3.5" />
+                    </button>
+                    <span className="text-xs font-semibold text-slate-300 truncate flex-1">{viewingSession.title}</span>
+                  </motion.div>
+                ) : (
+                  <motion.div key="live" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex items-center gap-2">
+                    {isLive && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />}
+                    <span className="text-[10px] font-bold uppercase tracking-widest text-slate-500 truncate">{isLive ? `Talking with ${activeVoiceName}` : "Conversation"}</span>
+                  </motion.div>
+                )}
               </AnimatePresence>
+            </div>
+
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto px-5 pb-5 pt-4 z-10 custom-scrollbar">
+              <AnimatePresence initial={false}>
+                {displayedMessages.length === 0 ? (
+                  <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="h-full flex flex-col items-center justify-center gap-3 text-slate-700">
+                    <div className="w-10 h-10 rounded-2xl bg-white/5 border border-white/5 flex items-center justify-center"><Mic className="w-4 h-4 text-zinc-600" /></div>
+                    <p className="text-[9px] font-bold text-center uppercase tracking-widest text-zinc-600">Conversation Empty</p>
+                  </motion.div>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    {displayedMessages.map((msg, i) => (
+                      <motion.div key={`${viewingSessionId ?? "live"}-${i}`} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.15 }} className={`flex flex-col gap-0.5 ${msg.role === "user" ? "items-end" : "items-start"}`}>
+                        <span className={`text-[8px] font-bold uppercase tracking-[0.2em] px-1 ${msg.role === "user" ? "text-emerald-500/50" : "text-slate-600"}`}>
+                          {msg.role === "user" ? "You" : activeVoiceName}
+                        </span>
+                        <div className={`max-w-[90%] px-3 py-2 rounded-2xl text-[11px] leading-relaxed ${msg.role === "user" ? "bg-emerald-500/10 border border-emerald-500/20 text-emerald-100 rounded-tr-sm" : "bg-white/5 border border-white/10 text-slate-200 rounded-tl-sm"}`}>
+                          {msg.text}
+                        </div>
+                      </motion.div>
+                    ))}
+                    <div ref={chatEndRef} />
+                  </div>
+                )}
+              </AnimatePresence>
+            </div>
+
+            {/* Chat Input (Gemini style) */}
+            <div className="shrink-0 p-4 border-t border-white/5 bg-[#0c0c0e] z-20">
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (!chatInput.trim()) return;
+                  if (viewingSession) setViewingSessionId(null);
+                  sendText(chatInput.trim());
+                  setChatInput("");
+                }}
+                className="relative flex items-center bg-white/[0.03] border border-white/10 rounded-2xl px-4 py-2 hover:bg-white/[0.05] transition-colors focus-within:bg-white/[0.05] focus-within:border-white/20"
+              >
+                <input
+                  type="text"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  placeholder="Type a message..."
+                  className="flex-1 bg-transparent text-[11px] text-slate-200 placeholder:text-zinc-600 focus:outline-none"
+                />
+                <button
+                  type="submit"
+                  disabled={!chatInput.trim()}
+                  className="p-1 ml-2 text-slate-500 hover:text-emerald-400 disabled:opacity-50 disabled:hover:text-slate-500 transition-colors"
+                >
+                  <Send className="w-4 h-4" />
+                </button>
+              </form>
             </div>
           </div>
 
-          {/* Controls row */}
-          <div className="absolute bottom-8 flex items-center gap-4 z-20">
-            {/* Voice pill */}
-            <button
-              onClick={() => setIsVoiceLibraryOpen(true)}
-              className="flex items-center gap-2 pl-3 pr-4 h-11 rounded-full bg-white/5 border border-white/10 text-slate-400 hover:bg-white/10 hover:text-white transition-all"
-              title={`Voice: ${activeVoiceName}`}
-            >
-              <Settings2 className="w-3.5 h-3.5 text-emerald-500" />
-              <span className="text-[10px] font-bold uppercase tracking-wider max-w-[90px] truncate">{activeVoiceName}</span>
-            </button>
+          {/* ═══════════════════════════════════════
+              RIGHT BENTO — Split Panels
+          ═══════════════════════════════════════ */}
+          <div className="flex-[0.3] flex flex-col gap-4 overflow-hidden h-full">
+            
+            {/* Row 1: Telephony Box */}
+            <div className="flex-[0.55] rounded-3xl bg-[#0c0c0e] border border-white/[0.05] overflow-hidden shadow-2xl flex flex-col">
+               <TelephonyBento activeVoiceId={activeVoiceId} />
+            </div>
 
-            {/* STT chip — quick toggle between Sarvam (cloud) and local
-                Whisper. Whisper loads onto GPU only when selected. */}
-            <SttChip />
+            {/* Row 2: Telemetry / Logs */}
+            <div className="flex-[0.45] rounded-3xl bg-[#0c0c0e] border border-white/[0.05] overflow-hidden shadow-2xl flex flex-col">
+               <TelemetryBento onPhoneMessage={handlePhoneMessage} />
+            </div>
 
-            {/* Model pill */}
-            <button
-              onClick={() => setIsModelSettingsOpen(true)}
-              className="flex items-center gap-2 pl-3 pr-4 h-11 rounded-full bg-white/5 border border-white/10 text-slate-400 hover:bg-white/10 hover:text-white transition-all"
-              title={`Model: ${activeModel.name}`}
-            >
-              <div className="p-0.5 bg-indigo-500/20 rounded-md">
-                <Sparkles className="w-3 h-3 text-indigo-400" />
-              </div>
-              <span className="text-[10px] font-bold uppercase tracking-wider max-w-[90px] truncate">{activeModel.name}</span>
-            </button>
-
-            {/* ── Mic button (hero) ── */}
-            <button
-              onClick={() => {
-                if (viewingSession) setViewingSessionId(null);
-                toggleLive();
-              }}
-              className={`relative w-16 h-16 rounded-full flex items-center justify-center border-2 transition-all duration-500 ${
-                isLive
-                  ? "bg-red-500/20 text-red-400 border-red-500/40 shadow-[0_0_50px_rgba(239,68,68,0.25)]"
-                  : "bg-white text-black border-transparent shadow-2xl shadow-blue-500/10 hover:scale-105"
-              }`}
-            >
-              {isLive ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
-              {isLive && (
-                <span className="absolute inset-0 rounded-full animate-ping bg-red-500/20 pointer-events-none" />
-              )}
-            </button>
-
-            {/* Phone */}
-            <button
-              onClick={() => setIsDialerOpen(true)}
-              className="w-11 h-11 rounded-full bg-white/5 border border-white/10 flex items-center justify-center text-slate-500 hover:bg-emerald-500/10 hover:text-emerald-400 transition-all"
-            >
-              <Phone className="w-4 h-4" />
-            </button>
-
-            {/* Call History */}
-            <button
-              onClick={() => setIsHistoryOpen(true)}
-              className="w-11 h-11 rounded-full bg-white/5 border border-white/10 flex items-center justify-center text-slate-500 hover:bg-indigo-500/10 hover:text-indigo-400 transition-all"
-            >
-              <History className="w-4 h-4" />
-            </button>
-
-            {/* System Monitor */}
-            <button
-              onClick={() => setIsSystemMonitorOpen(v => !v)}
-              className={`w-11 h-11 rounded-full border flex items-center justify-center transition-all ${
-                isSystemMonitorOpen
-                  ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-400"
-                  : "bg-white/5 border-white/10 text-slate-500 hover:bg-emerald-500/10 hover:text-emerald-400"
-              }`}
-              title="System Monitor"
-            >
-              <Activity className="w-4 h-4" />
-            </button>
           </div>
-        </div>
-
-        {/* ═══════════════════════════════════════
-            RIGHT — Chat Panel
-        ═══════════════════════════════════════ */}
-        <div className="w-[420px] flex flex-col border-l border-white/[0.04] bg-white/[0.02] backdrop-blur-2xl relative overflow-hidden">
-
-          {/* Subtle top fade */}
-          <div className="absolute top-0 inset-x-0 h-20 bg-gradient-to-b from-black/30 to-transparent pointer-events-none z-10" />
-
-          {/* Header */}
-          <div className="shrink-0 px-5 pt-5 pb-4 z-20">
-            <AnimatePresence mode="wait">
-              {viewingSession ? (
-                <motion.div
-                  key="history"
-                  initial={{ opacity: 0, y: -6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -6 }}
-                  className="flex items-center gap-2"
-                >
-                  <button
-                    onClick={() => setViewingSessionId(null)}
-                    className="p-1.5 rounded-lg hover:bg-white/10 text-slate-500 hover:text-white transition-colors"
-                  >
-                    <ArrowLeft className="w-3.5 h-3.5" />
-                  </button>
-                  <span className="text-xs font-semibold text-slate-300 truncate flex-1">
-                    {viewingSession.title}
-                  </span>
-                </motion.div>
-              ) : (
-                <motion.div
-                  key="live"
-                  initial={{ opacity: 0, y: -6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -6 }}
-                  className="flex items-center gap-2"
-                >
-                  {isLive && (
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-                  )}
-                  <span className="text-xs font-semibold text-slate-500 truncate">
-                    {isLive ? `Talking with ${activeVoiceName}` : "Conversation"}
-                  </span>
-                </motion.div>
-              )}
-            </AnimatePresence>
-
-            <div className="mt-3 h-px bg-gradient-to-r from-transparent via-white/8 to-transparent" />
-          </div>
-
-          {/* Messages */}
-          <div className="flex-1 overflow-y-auto px-5 pb-6 z-10 scrollbar-hide">
-            <AnimatePresence initial={false}>
-              {displayedMessages.length === 0 ? (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  className="h-full flex flex-col items-center justify-center gap-3 text-slate-700 py-20"
-                >
-                  <div className="w-12 h-12 rounded-2xl bg-white/5 border border-white/5 flex items-center justify-center">
-                    <Mic className="w-5 h-5" />
-                  </div>
-                  <p className="text-xs font-medium text-center leading-relaxed">
-                    Press mic and<br />start speaking
-                  </p>
-                </motion.div>
-              ) : (
-                <div className="flex flex-col gap-2 pt-2">
-                  {displayedMessages.map((msg, i) => (
-                    <motion.div
-                      key={`${viewingSessionId ?? "live"}-${i}`}
-                      initial={{ opacity: 0, y: 8 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      transition={{ duration: 0.18, delay: Math.min(i * 0.02, 0.3) }}
-                      className={`flex flex-col gap-1 ${msg.role === "user" ? "items-end" : "items-start"}`}
-                    >
-                      <span className={`text-[9px] font-bold uppercase tracking-[0.2em] px-1 ${
-                        msg.role === "user" ? "text-emerald-500/50" : "text-slate-600"
-                      }`}>
-                        {msg.role === "user" ? "You" : activeVoiceName}
-                      </span>
-                      <div className={`max-w-[88%] px-4 py-3 rounded-2xl text-[13px] leading-relaxed ${
-                        msg.role === "user"
-                          ? "bg-emerald-500/12 border border-emerald-500/20 text-emerald-50 rounded-br-md"
-                          : "bg-white/6 border border-white/8 text-slate-200 rounded-bl-md"
-                      }`}>
-                        {msg.text}
-                      </div>
-                    </motion.div>
-                  ))}
-                  <div ref={chatEndRef} />
-                </div>
-              )}
-            </AnimatePresence>
-          </div>
-
-          {/* Bottom subtle fade */}
-          <div className="absolute bottom-0 inset-x-0 h-8 bg-gradient-to-t from-black/30 to-transparent pointer-events-none" />
         </div>
       </motion.div>
-
-      {/* ── Modals ── */}
-      <Dialer isOpen={isDialerOpen} onClose={() => setIsDialerOpen(false)} onDial={handleDial} />
-      <CallHistory isOpen={isHistoryOpen} onClose={() => setIsHistoryOpen(false)} activeVoiceId={activeVoiceId} />
-      <VoiceLibrary
-        isOpen={isVoiceLibraryOpen}
-        onClose={() => setIsVoiceLibraryOpen(false)}
-        activeVoiceId={activeVoiceId}
-        onSelect={(id) => { setActiveVoiceId(id); switchVoice(id); setTimeout(() => setIsVoiceLibraryOpen(false), 800); }}
-      />
-      <ModelSettings
-        isOpen={isModelSettingsOpen}
-        onClose={() => setIsModelSettingsOpen(false)}
-        activeModelId={activeModel.id}
-        onSelect={(id, name) => { setActiveModel({ id, name }); switchModel(id); setTimeout(() => setIsModelSettingsOpen(false), 600); }}
-      />
-      <LogViewer />
-      <SystemMonitor isOpen={isSystemMonitorOpen} onClose={() => setIsSystemMonitorOpen(false)} />
     </main>
   );
 }

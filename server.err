@@ -1,0 +1,29 @@
+E:\Ai\Omini with Astrisk\Omini\web_backend\main.py:38: DeprecationWarning: 'audioop' is deprecated and slated for removal in Python 3.13
+  import audioop
+INFO:     Started server process [4008]
+INFO:     Waiting for application startup.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/313 [00:00<?, ?it/s]Loading weights:   1%|▏         | 4/313 [00:00<00:34,  8.97it/s]Loading weights: 100%|██████████| 313/313 [00:00<00:00, 639.97it/s]
+Fetching 13 files:   0%|          | 0/13 [00:00<?, ?it/s]Fetching 13 files: 100%|██████████| 13/13 [00:00<?, ?it/s]
+Loading weights:   0%|          | 0/527 [00:00<?, ?it/s]Loading weights:  37%|███▋      | 197/527 [00:00<00:00, 1963.05it/s]Loading weights:  75%|███████▍  | 394/527 [00:00<00:00, 1310.40it/s]Loading weights: 100%|██████████| 527/527 [00:00<00:00, 1298.79it/s]
+Loading weights:   0%|          | 0/587 [00:00<?, ?it/s]Loading weights:   9%|▉         | 54/587 [00:00<00:01, 520.87it/s]Loading weights:  24%|██▎       | 139/587 [00:00<00:00, 679.22it/s]Loading weights:  38%|███▊      | 225/587 [00:00<00:00, 720.18it/s]Loading weights:  53%|█████▎    | 309/587 [00:00<00:00, 764.01it/s]Loading weights:  66%|██████▋   | 390/587 [00:00<00:00, 746.02it/s]Loading weights:  82%|████████▏ | 481/587 [00:00<00:00, 768.51it/s]Loading weights:  98%|█████████▊| 574/587 [00:00<00:00, 803.75it/s]Loading weights: 100%|██████████| 587/587 [00:00<00:00, 764.78it/s]
+Using custom `forced_decoder_ids` from the (generation) config. This is deprecated in favor of the `task` and `language` flags/config options.
+Transcription using a multilingual Whisper will default to language detection followed by transcription instead of translation to English. This might be a breaking change for your use case. If you want to instead always translate your audio to English, make sure to pass `language='en'`. See https://github.com/huggingface/transformers/pull/28687 for more details.
+A custom logits processor of type <class 'transformers.generation.logits_process.SuppressTokensLogitsProcessor'> has been passed to `.generate()`, but it was also created in `.generate()`, given its parameterization. The custom <class 'transformers.generation.logits_process.SuppressTokensLogitsProcessor'> will take precedence. Please check the docstring of <class 'transformers.generation.logits_process.SuppressTokensLogitsProcessor'> to see related `.generate()` flags.
+A custom logits processor of type <class 'transformers.generation.logits_process.SuppressTokensAtBeginLogitsProcessor'> has been passed to `.generate()`, but it was also created in `.generate()`, given its parameterization. The custom <class 'transformers.generation.logits_process.SuppressTokensAtBeginLogitsProcessor'> will take precedence. Please check the docstring of <class 'transformers.generation.logits_process.SuppressTokensAtBeginLogitsProcessor'> to see related `.generate()` flags.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:58285 - "WebSocket /ws/logs" [accepted]
+INFO:     connection open
+INFO:     192.168.8.59:34174 - "WebSocket /ws/phone" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     connection closed
+INFO:     127.0.0.1:64705 - "WebSocket /ws/logs" [accepted]
+INFO:     connection open
+INFO:     192.168.8.59:59916 - "WebSocket /ws/phone" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     127.0.0.1:49546 - "WebSocket /ws/logs" [accepted]
+INFO:     connection open
+INFO:     connection closed

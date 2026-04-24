@@ -1,0 +1,12 @@
+[pyrefly]
+# Use the project's virtual environment so third-party packages resolve
+# (omnivoice, fastapi, httpx, torch, etc.) and the 99+ virtual-stub errors
+# in the Problems panel go away.
+python_interpreter = ".venv/Scripts/python.exe"
+
+# Add web_backend/ to the module search path so `from campaigns import ...`
+# and `from stt_providers import ...` resolve without the try/except trick.
+search_path = [
+    "web_backend",
+    ".",
+]

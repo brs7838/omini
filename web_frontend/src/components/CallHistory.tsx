@@ -90,11 +90,17 @@ export default function CallHistory({ isOpen, onClose, activeVoiceId }: CallHist
     <AnimatePresence>
       {isOpen && (
         <motion.div
-          initial={{ x: "100%" }}
-          animate={{ x: 0 }}
-          exit={{ x: "100%" }}
-          className="fixed right-0 top-0 h-screen w-full max-w-sm bg-zinc-950 border-l border-white/10 z-[60] flex flex-col shadow-2xl backdrop-blur-xl bg-opacity-95"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
         >
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.95, y: 10 }}
+            className="w-full max-w-2xl max-h-[85vh] bg-[#0c0c0e] border border-white/10 rounded-2xl shadow-2xl flex flex-col overflow-hidden backdrop-blur-xl"
+          >
           <div className="p-8 flex justify-between items-center border-b border-white/5">
             <div>
               <h2 className="text-lg font-bold text-white tracking-tight">Call History</h2>
@@ -179,9 +185,10 @@ export default function CallHistory({ isOpen, onClose, activeVoiceId }: CallHist
             </div>
           </div>
 
-          <div className="p-8 border-t border-white/5 text-[9px] uppercase tracking-[0.3em] font-black text-center text-zinc-700">
+          <div className="p-8 border-t border-white/5 text-[9px] uppercase tracking-[0.3em] font-black text-center text-zinc-700 bg-zinc-900/30">
              Vaani Telephony Service
           </div>
+          </motion.div>
         </motion.div>
       )}
     </AnimatePresence>

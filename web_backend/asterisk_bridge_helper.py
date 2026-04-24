@@ -1,4 +1,5 @@
 import asyncio
+from typing import Optional
 import json
 import socket
 import struct
@@ -15,7 +16,7 @@ import sys
 
 # Ensure imports work when run from within web_backend
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from engine import WebAssistant
+from engine import WebAssistant  # type: ignore
 
 # --- Voice Loading ---
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,12 +45,13 @@ class RTPProtocol(asyncio.DatagramProtocol):
         self.on_data_received(data, addr)
 
 class AsteriskCallSession:
-    def __init__(self, channel_id, bridge_app, log_handler=None, voice_id=None):
+    def __init__(self, channel_id, bridge_app, log_handler=None, voice_id=None, transcript_handler=None):
         self.channel_id = channel_id
         self.bridge_app = bridge_app
         self.rtp_peer_pt = 11 # [Phase 18] Aligned with standard SLIN/L16 Payload Type
         self.rtp_ssrc = os.urandom(4) # Unique SSRC for every session
         self.log_handler = log_handler
+        self.transcript_handler = transcript_handler
         self.voice_id = voice_id
         self.external_channel_id = None
         self.bridge_id = None
@@ -61,6 +63,9 @@ class AsteriskCallSession:
         self.rtp_ts = random.randint(10000, 50000)
         self.rtp_buffer = bytearray()
         self.rtp_buffer_count = 0
+        self._playback_queue: asyncio.Queue = asyncio.Queue()
+        self._playback_task: Optional[asyncio.Task] = None
+        self._last_ai_audio_time = 0.0
         self.ai_audio_queue = asyncio.Queue()
         self.transport = None
         self.protocol = None
@@ -70,8 +75,7 @@ class AsteriskCallSession:
         self.peer_addr = ('192.168.8.59', 10000)
         
         # [Phase 13/17] Heartbeat task
-        self._heartbeat_task = None
-        self._last_ai_audio_time = 0
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
         # RTP inbound rate tracer counters
         self._rtp_in_count = 0
@@ -262,13 +266,8 @@ class AsteriskCallSession:
                 print(msg, flush=True)
                 if self.log_handler: await self.log_handler("asterisk", msg)
 
-            # Auto-greet in selected voice (single path — direct TTS, then END_RESPONSE
-            # so is_speaking resets cleanly and VAD opens up for the user's first turn).
-            name = self.assistant.active_voice_metadata.get("name", "Vaani")
-            gender_verb = "raha" if self.assistant.active_voice_metadata.get("gender") == "male" else "rahi"
-            greet = f"नमस्ते! मैं {name} बोल {gender_verb} हूँ। आज मैं आपकी क्या सहायता कर सकता हूँ?"
-            await self.assistant.tts_queue.put(greet)
-            await self.assistant.tts_queue.put("__END_RESPONSE__")
+            # Auto-greet removed. We rely on deterministic hand-crafted
+            # TTS greeting pushed correctly by the backend logic, not duplicating it here.
 
             print(f"[Call {self.channel_id}] Fully connected and bridged to shared AI core.", flush=True)
         except Exception as e:
@@ -389,8 +388,14 @@ class AsteriskCallSession:
                         frames_sent += 1
                         
                         expected_elapsed = (frames_sent * 0.020)
+                        sleep_for = expected_elapsed - (time.perf_counter() - session_start_time)
+                        
+                        # Windows asyncio.sleep has ~15ms minimum resolution. 
+                        # We sleep for the bulk, then spin-yield for precision.
+                        if sleep_for > 0.015:
+                            await asyncio.sleep(sleep_for - 0.015)
                         while (time.perf_counter() - session_start_time) < expected_elapsed:
-                            await asyncio.sleep(0.001)
+                            await asyncio.sleep(0)
                     
                     self._last_ai_audio_time = time.time()
                 self.ai_audio_queue.task_done()
@@ -406,11 +411,15 @@ class AsteriskCallSession:
             # [NON-BLOCKING] Push to queue to unblock engine's tts_worker
             self.ai_audio_queue.put_nowait(data)
         elif msg_type == "transcript":
-            role = data['role'].upper()
-            text = data['text']
-            print(f"[Bridge-Transcript] {role}: {text}")
+            role = data.get('role', 'ai')
+            text = data.get('text', '')
+            print(f"[Bridge-Transcript] {role.upper()}: {text}")
+            # Push to conversation UI (/ws voice_clients) so live transcript
+            # appears during Asterisk calls — same channel browser mode uses.
+            if self.transcript_handler:
+                await self.transcript_handler(role, text)
             if self.log_handler:
-                await self.log_handler("transcript", {"role": role, "text": text, "source": "asterisk"})
+                await self.log_handler("transcript", {"role": role.upper(), "text": text, "source": "asterisk"})
         else:
             # Forward every other msg_type (log, status, llm_chunk, ...) to /ws/logs
             # so the browser LogViewer sees engine pipeline events during Asterisk calls.
@@ -433,7 +442,7 @@ class AsteriskCallSession:
             self._rtp_tracer_task.cancel()
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
-        if hasattr(self, '_playback_task'):
+        if hasattr(self, '_playback_task') and self._playback_task:
             self._playback_task.cancel()
 
         if self.transport:
@@ -452,9 +461,10 @@ class AsteriskCallSession:
         print(f"[Call {self.channel_id}] Terminated.")
 
 class VaaniAsteriskBridge:
-    def __init__(self, log_handler=None):
+    def __init__(self, log_handler=None, transcript_handler=None):
         self.sessions = {}
         self.log_handler = log_handler
+        self.transcript_handler = transcript_handler
         self.local_ip = self.detect_local_ip()
         self.is_running = True
         print(f"[Bridge] Initialized on local IP: {self.local_ip}")
@@ -505,6 +515,14 @@ class VaaniAsteriskBridge:
                             if is_external:
                                 continue
 
+                            # Skip channels originated by rpi_audio_bridge.py —
+                            # those are handled by /ws/phone on this server.
+                            caller_info = channel.get("caller", {})
+                            if (caller_info.get("name") == "AI-Call"
+                                    or caller_info.get("number") == "AI-Call"):
+                                print(f"[Bridge] Skipping RPi bridge channel: {channel_id}", flush=True)
+                                continue
+
                             caller = channel.get("caller", {}).get("number", "Unknown")
                             args = event.get("args", [])
                             voice_id = args[2] if len(args) >= 3 else None
@@ -512,7 +530,7 @@ class VaaniAsteriskBridge:
                             print(f"\n[Bridge] {msg}", flush=True)
                             if self.log_handler: await self.log_handler("asterisk", msg)
 
-                            session = AsteriskCallSession(channel_id, self, log_handler=self.log_handler, voice_id=voice_id)
+                            session = AsteriskCallSession(channel_id, self, log_handler=self.log_handler, voice_id=voice_id, transcript_handler=self.transcript_handler)
                             self.sessions[channel_id] = session
                             asyncio.create_task(session.start())
                             
@@ -522,6 +540,30 @@ class VaaniAsteriskBridge:
                                 print(f"[Bridge] CALL ENDED: {channel_id}", flush=True)
                                 await self.sessions[channel_id].stop()
                                 del self.sessions[channel_id]
+
+                        elif event_type == "ChannelDestroyed":
+                            # Log hangup cause for every outbound originate that
+                            # dies without ever hitting Stasis. Without this, a
+                            # failed call (unreachable gateway, 403 from SIP
+                            # trunk, GSM no-answer, etc.) silently shows "200 OK"
+                            # in the backend log because the only thing recorded
+                            # is the originate HTTP response — the real failure
+                            # reason is buried in ARI events we weren't capturing.
+                            channel = event.get("channel", {})
+                            cname = channel.get("name", "?")
+                            cid = channel.get("id", "?")
+                            cstate = channel.get("state", "?")
+                            cause = event.get("cause")
+                            cause_txt = event.get("cause_txt") or "(no text)"
+                            # Skip noisy UnicastRTP destroys — those are our
+                            # ExternalMedia cleanup, not real call failures.
+                            if not cname.startswith("UnicastRTP"):
+                                msg = (f"CHANNEL DESTROYED {cid} name={cname} "
+                                       f"final_state={cstate} cause={cause} "
+                                       f"reason='{cause_txt}'")
+                                print(f"[Bridge] {msg}", flush=True)
+                                if self.log_handler:
+                                    await self.log_handler("asterisk", msg)
 
             except Exception as e:
                 if self.is_running:

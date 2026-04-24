@@ -35,9 +35,11 @@ def to_8k(audio, orig_sr=24000, device="cpu"):
         
     # Standard 24k -> 8k is a simple 3:1 decimation
     if orig_sr == 24000:
-        return signal.decimate(audio, 3).astype(np.float32)
+        out = signal.decimate(audio, 3)
+        return np.asanyarray(out).astype(np.float32)
     
     # Generic resample for other rates
     ratio = 8000 / orig_sr
     num_samples = int(len(audio) * ratio)
-    return signal.resample(audio, num_samples).astype(np.float32)
+    out = signal.resample(audio, num_samples)
+    return np.asanyarray(out).astype(np.float32)

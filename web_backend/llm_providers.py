@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 
 
 OLLAMA_DEFAULT_URL = "http://127.0.0.1:11434/v1/chat/completions"
@@ -27,6 +27,9 @@ OLLAMA_API_BASE = "http://127.0.0.1:11434"
 
 SARVAM_URL = "https://api.sarvam.ai/v1/chat/completions"
 SARVAM_DEFAULT_MODEL = "sarvam-m"  # mid-tier ("average") Indic LLM
+
+MINIMAX_URL = "https://api.minimax.io/v1/chat/completions"
+MINIMAX_DEFAULT_MODEL = "MiniMax-M2.5"
 
 # Persisted provider choice. Sits at project root next to campaigns.json so the
 # user's runtime /provider/switch survives a restart — otherwise each boot
@@ -123,7 +126,7 @@ async def ollama_warmup(http_client, model: str) -> bool:
         r = await http_client.post(
             f"{OLLAMA_API_BASE}/api/generate",
             json={"model": model, "prompt": "hi", "stream": False,
-                  "options": {"num_predict": 1, "num_gpu": 99}},
+                  "options": {"num_predict": 1, "num_gpu": 0, "num_ctx": 4096}},
             timeout=60.0,
         )
         return r.status_code == 200
@@ -155,24 +158,54 @@ class LLMProvider:
         if self.name == "ollama":
             return {
                 "options": {
-                    "num_predict": 300,
-                    "temperature": 0.5,
-                    "num_gpu": 99,
+                    "num_predict": 128,
+                    "num_gpu": 0,
                     "num_ctx": 4096,
                 },
             }
         if self.name == "sarvam":
-            # reasoning_effort=null disables Sarvam's "think" mode. Without
-            # this, Sarvam-M / Sarvam-30B default to "medium" and stream their
-            # English chain-of-thought as regular content — which the TTS then
-            # happily speaks out loud before the real Hindi answer. Not what
-            # voters should hear.
+            # 105B is a thinking model — it can burn 500+ tokens on internal
+            # <think> reasoning before producing the spoken answer. 512 was
+            # leaving nothing for actual output on longer reasoning turns,
+            # causing silent responses. 1024 gives the model enough headroom.
             return {
-                "max_tokens": 300,
+                "max_tokens": 1024,
                 "temperature": 0.5,
-                "reasoning_effort": None,
+                "top_p": 0.9,
+            }
+        if self.name == "minimax":
+            return {
+                "max_tokens": 1024,
+                "temperature": 0.7,
+                "top_p": 0.9,
             }
         return {}
+
+    def build_payload(self, system_prompt: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        """Construct the base OpenAI-compatible request structure."""
+        effective_model = self.model
+        effective_system = system_prompt
+
+        # Handle MiniMax "Non-Thinking" variants by stripping the UI suffix
+        # and adding a strict "no-reasoning" instruction to the system prompt.
+        if self.name == "minimax" and "-non-thinking" in self.model:
+            effective_model = self.model.replace("-non-thinking", "")
+            effective_system += "\n\nCRITICAL: Do NOT think or reason internally. Provide the direct answer immediately without any <think> tags or internal monologue."
+
+        # Personality for Speed & Realism
+        effective_system += "\n\nPERSONALITY: You are Ravi, a friendly and expressive person. Speak like a friend. If you say a famous dialogue, say it with style!! Use [laughter], [sigh] naturally. React to your own words (e.g. 'अरे वाह!')."
+        
+        effective_system += "\n\nSTYLE: Use 'हम्म...', 'यार...', 'मतलब...' naturally. Keep responses short. No digits, use Devanagari words only. No Roman script."
+
+        # Emotion Tag Rule:
+        effective_system += "\n\nEMOTION: Use [laughter], [sigh], [sniff] to sound human."
+
+        full_messages = [{"role": "system", "content": effective_system}] + messages
+        return {
+            "model": effective_model,
+            "messages": full_messages,
+            "stream": True,
+        }
 
 
 def resolve_provider(
@@ -221,9 +254,24 @@ def resolve_provider(
             uses_local_gpu=False,
         )
 
+    if name == "minimax":
+        api_key = os.environ.get("MINIMAX_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError(
+                "LLM_PROVIDER=minimax but MINIMAX_API_KEY is not set. "
+                "Add it to .env or export it in your shell."
+            )
+        return LLMProvider(
+            name="minimax",
+            url=MINIMAX_URL,
+            model=model_override or MINIMAX_DEFAULT_MODEL,
+            auth_header=("Authorization", f"Bearer {api_key}"),
+            uses_local_gpu=False,
+        )
+
     if name != "ollama":
         raise RuntimeError(
-            f"Unknown LLM_PROVIDER={name!r}. Expected 'ollama' or 'sarvam'."
+            f"Unknown LLM_PROVIDER={name!r}. Expected 'ollama', 'sarvam', or 'minimax'."
         )
 
     return LLMProvider(

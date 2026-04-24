@@ -19,7 +19,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["PYTHONFPEMASK"] = "1"
 os.environ["NPY_DISABLE_CPU_FEATURES"] = "AVX512F"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID" # Ensure index matches hardware
-os.environ["OLLAMA_MAX_LOADED_MODELS"] = "0"   # Force Ollama to be lean
+os.environ["OLLAMA_MAX_LOADED_MODELS"] = "1"   # Keep one model in memory for faster turn-around
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["HF_HUB_OFFLINE"] = "1"           # Force local model loading (Bypass DNS errors)
 # -------------------------------------------------------------
@@ -39,21 +39,22 @@ def kill_port(port):
         pass # Port probably already free
 
 def restart_ollama_pinned():
-    """Kill any running ollama.exe and relaunch `ollama serve` with CUDA_VISIBLE_DEVICES=0.
-    This pins Gemma 3:4B to the RTX 3060 alongside OmniVoice; the GTX 1650 is reserved
-    for Whisper and does not have enough VRAM for the LLM."""
-    print("[Ollama] Restarting pinned to cuda:0 (RTX 3060)...")
-    subprocess.run(['taskkill', '/F', '/IM', 'ollama.exe'], capture_output=True)
+    """Kill any running ollama.exe and relaunch `ollama serve` with CUDA_VISIBLE_DEVICES=1.
+    This pins Gemma 3:4B to the GTX 1650 alongside Whisper, leaving the RTX 3060
+    entirely for OmniVoice (TTS)."""
+    print("[Ollama] Restarting on primary GPU (RTX 3060)...")
+    subprocess.run(['taskkill', '/F', '/IM', 'ollama*'], capture_output=True)
     time.sleep(1)
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = "0"
+    env["CUDA_VISIBLE_DEVICES"] = ""
     env["OLLAMA_HOST"] = "127.0.0.1:11434"
     # Detach so the launcher can exit without killing the Ollama server.
     creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | \
                     getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+    log_file = open("ollama.log", "w")
     try:
         subprocess.Popen(["ollama", "serve"], env=env, creationflags=creationflags,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                         stdout=log_file, stderr=subprocess.STDOUT)
     except FileNotFoundError:
         print("[Ollama] WARNING: `ollama` not on PATH. Skipping restart — assuming external service.")
         return
@@ -62,7 +63,7 @@ def restart_ollama_pinned():
     for i in range(30):
         try:
             urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1).read()
-            print(f"[Ollama] Pinned to cuda:0, API responding after {i+1}s.")
+            print(f"[Ollama] Pinned to cuda:1, API responding after {i+1}s.")
             return
         except Exception:
             time.sleep(1)
@@ -138,18 +139,6 @@ def run():
     except Exception as _e:
         print(f"[Launcher] provider_config.json read skipped: {_e}")
     if llm_provider == "ollama":
-        # Free any stale Ollama model caches before relaunching pinned to cuda:0.
-        print("[0.5/3] Freeing Ollama GPU cache...")
-        try:
-            import urllib.request
-            for model in ["gemma3:4b", "gemma4:e4b"]:
-                req = urllib.request.Request("http://localhost:11434/api/generate",
-                    data=f'{{"model":"{model}","keep_alive":0}}'.encode(), method="POST")
-                urllib.request.urlopen(req, timeout=5)
-        except Exception:
-            pass
-        time.sleep(2)
-
         # Restart Ollama pinned to RTX 3060 so gemma3:4b lives alongside OmniVoice.
         restart_ollama_pinned()
     else:
@@ -192,7 +181,7 @@ def run():
 
     
     # Wait for Frontend
-    if not wait_for_port(3000):
+    if not wait_for_port(3000, timeout=60):
         print("Frontend failed to start. Check web_frontend logs.")
         backend_p.terminate()
         frontend_p.terminate()

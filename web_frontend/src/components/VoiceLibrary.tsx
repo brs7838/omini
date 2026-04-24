@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { Upload, X, Check, Trash2, Mic, Pencil, Wand2, Plus, Sparkles } from "lucide-react";
+import { Upload, X, Check, Trash2, Mic, Pencil, Plus, Sparkles } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
 interface Voice {
@@ -144,7 +144,7 @@ function VoiceCard({
           animate={{ opacity: 1, y: 0 }}
           className="absolute -bottom-10 left-1/2 -translate-x-1/2 w-max max-w-[180px] px-2.5 py-1.5 rounded-lg bg-slate-900 border border-white/10 text-[10px] text-emerald-400/80 italic text-center z-50 pointer-events-none shadow-xl"
         >
-          "{voice.catchphrases.slice(0, 60)}{voice.catchphrases.length > 60 ? "…" : ""}"
+          &quot;{voice.catchphrases.slice(0, 60)}{voice.catchphrases.length > 60 ? "&hellip;" : ""}&quot;
         </motion.div>
       )}
     </motion.div>
@@ -173,7 +173,12 @@ export default function VoiceLibrary({ isOpen, onClose, activeVoiceId, onSelect 
     } catch { /* silent */ }
   };
 
-  useEffect(() => { if (isOpen) fetchVoices(); }, [isOpen]);
+  useEffect(() => {
+    if (isOpen) {
+      const t = setTimeout(() => fetchVoices(), 0);
+      return () => clearTimeout(t);
+    }
+  }, [isOpen]);
 
   const closeForm = () => {
     setShowForm(false);
@@ -254,14 +259,14 @@ export default function VoiceLibrary({ isOpen, onClose, activeVoiceId, onSelect 
   return (
     <AnimatePresence>
       {isOpen && (
-        <>
+        <div className="absolute inset-0 z-[100] flex items-center justify-center p-4 pointer-events-auto">
           {/* Backdrop */}
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             onClick={onClose}
-            className="fixed inset-0 bg-black/70 backdrop-blur-md z-[60]"
+            className="absolute inset-0 bg-black/70 backdrop-blur-md z-[60]"
           />
 
           {/* Card */}
@@ -270,10 +275,10 @@ export default function VoiceLibrary({ isOpen, onClose, activeVoiceId, onSelect 
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.94, y: 12 }}
             transition={{ type: "spring", stiffness: 380, damping: 30 }}
-            className="fixed inset-0 z-[70] flex items-center justify-center p-4 pointer-events-none"
+            className="absolute inset-0 z-[100] flex items-center justify-center p-4"
           >
             <div
-              className="w-full max-w-[540px] max-h-[85vh] bg-slate-950/90 backdrop-blur-2xl border border-white/8 rounded-3xl shadow-[0_30px_80px_rgba(0,0,0,0.6)] flex flex-col overflow-hidden pointer-events-auto"
+              className="w-[95%] h-[95%] max-w-[540px] max-h-[85vh] bg-slate-950/90 backdrop-blur-2xl border border-white/8 rounded-3xl shadow-[0_30px_80px_rgba(0,0,0,0.6)] flex flex-col overflow-hidden pointer-events-auto"
               onClick={e => e.stopPropagation()}
             >
               {/* ── Header ── */}
@@ -472,7 +477,7 @@ export default function VoiceLibrary({ isOpen, onClose, activeVoiceId, onSelect 
               to   { transform: scaleY(1); }
             }
           `}</style>
-        </>
+        </div>
       )}
     </AnimatePresence>
   );

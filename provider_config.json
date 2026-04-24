@@ -1,4 +1,4 @@
 {
-  "provider": "ollama",
-  "model": "gemma3:4b"
+  "provider": "minimax",
+  "model": "MiniMax-M2.5-non-thinking"
 }

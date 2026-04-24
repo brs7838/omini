@@ -1,25 +1,28 @@
+from __future__ import annotations
 import asyncio
 import collections
+from typing import Optional, Dict, List, Any
+import sys
 import os
+import traceback
 import httpx
 import json
+import random
 import re
 import numpy as np
 import torch
 import time
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from scipy import signal
+import hashlib
 
-try:
-    from web_backend.campaigns import load_campaign, build_system_prompt
-    from web_backend.stt_providers import (
-        STTChoice, resolve_stt, build_stt, LocalWhisperSTT, SarvamSTT,
-    )
-except ImportError:
-    from campaigns import load_campaign, build_system_prompt
-    from stt_providers import (
-        STTChoice, resolve_stt, build_stt, LocalWhisperSTT, SarvamSTT,
-    )
+# Ensure imports work when run from within web_backend or parent dir
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from campaigns import load_campaign, build_system_prompt  # type: ignore
+from stt_providers import (  # type: ignore
+    STTChoice, resolve_stt, build_stt, LocalWhisperSTT, SarvamSTT,
+)
 
 
 _THINK_OPEN = "<think>"
@@ -82,10 +85,43 @@ def _strip_think_streaming(chunk: str, state: dict) -> str:
 # --- Configuration (Hardcoded for Vaani Web) ---
 LLM_URL = "http://127.0.0.1:11434/v1/chat/completions"
 LLM_MODEL = "gemma3:4b"
-SILENCE_CHUNKS = 3              # Increased to 3 (750ms) for conversational robustness
+SILENCE_CHUNKS = 12             # ~1s at 4096-sample frames (native-rate). Old value of 1 (~85ms) was splitting
+                                # one continuous sentence into multiple turns whenever the user paused to breathe,
+                                # so the LLM answered each fragment separately. 1s lets a speaker finish a thought.
 MAX_BUFFER_CHUNKS = 250
-BARGE_IN_FRAMES = 24            # Increased to 24 (~600ms) to ensure deliberate interruption
+BARGE_IN_FRAMES = 8             # Ensure AI stops immediately when user interrupts (fast barge-in)
 TTS_CHUNK_SAMPLES = 6000        # 250ms at 24kHz — stream small chunks for low-latency playback
+
+# Short acknowledgement phrases synthesized per voice so llm_worker can emit
+# one immediately at turn start. Must be brief (<1s synthesized) so they
+# finish playing before real TTS lands, and written with a terminal Devanagari
+# danda so OmniVoice's prosody planner treats each as a complete utterance.
+# Mix of bare acknowledgements and "go on" style invitations, picked at random
+# by llm_worker — keeps backchannels from sounding like a stuck record.
+_BACKCHANNEL_PHRASES = [
+    "अच्छा।", "हम्म।", "ठीक है।", "जी।", "हाँ।",
+    "अच्छा, आप बोलिए।", "हम्म, बोलिए।", "जी, बोलिए।", "हाँ, बोलिए।",
+]
+
+# How smart-backchannel gating behaves. Tuned to feel human:
+#   * MIN_GAP stops AI from "अच्छा" every single turn — real listeners don't.
+#   * PROBABILITY <1.0 means even when eligible, AI sometimes stays silent.
+#   * MIN_UTTERANCE_LEN skips backchannel on tiny "ok"/"haan" style turns
+#     where an immediate AI reply already lands fast enough.
+BACKCHANNEL_MIN_GAP_SEC = 5.0
+BACKCHANNEL_PROBABILITY = 0.0
+BACKCHANNEL_MIN_UTTERANCE_LEN = 12
+
+# Utterance coalescing window. Whisper/Sarvam flush a transcript as soon as
+# SILENCE_CHUNKS of silence elapse (~1s). But real speakers often pause
+# mid-sentence ("arre yaar … kaise ho … ye baat galat hai") — each pause
+# triggers a fresh flush, and the old code fed every fragment to the LLM
+# separately, so the AI replied to the tail scrap instead of the whole thought.
+# Fix: hold the transcript in a buffer for COALESCE_SEC; if more transcripts
+# land, concatenate and restart the timer. Only enqueue to llm_queue when the
+# user has been genuinely quiet for the full window. ChatGPT / Gemini voice
+# mode behave the same way.
+COALESCE_SEC = 1.0
 
 # Use absolute path for reliability
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -128,6 +164,19 @@ def clean_text(text):
     text = re.sub(r'[\U00010000-\U0010ffff]', '', text)
     # text = re.sub(r'[a-zA-Z]', '', text) # DELETED: Removing Roman characters was causing Hinglish silence.
     
+    # --- OmniVoice Native Hindi Punctuation Formatting ---
+    # To prevent "breathlessness" and "fluctuations" in long paragraphs:
+    # 1. OmniVoice Hindi expects Devanagari Danda for full stops.
+    text = text.replace('.', '।')
+    # 2. Exclamation marks often cause extreme overacting/fluctuating pitch. Map to Danda.
+    text = text.replace('!', '।')
+    # 3. Commas need explicit trailing spaces to guarantee a clean structural pause.
+    text = text.replace(',', ', ')
+    text = text.replace('?', '? ')
+    text = text.replace('-', ' ')
+    # 4. Collapse extra spaces
+    text = re.sub(r'\s+', ' ', text)
+    
     # 4. Final Cleanup: Remove any stray brackets that didn't form a valid tag (before restoring placeholders)
     # This prevents the AI from saying "k" or click-sounds for single brackets
     text = re.sub(r'[\[\]]', '', text)
@@ -138,6 +187,34 @@ def clean_text(text):
     
     return text.strip()
 
+def synth_backchannels(tts_model, voice_prompt) -> list[bytes]:
+    """Synthesize the standard backchannel phrases against a given voice
+    prompt and return a list of raw int16 PCM bytes at 24 kHz (ready to emit
+    via audio_chunk). Runs synchronously on the calling thread — callers that
+    need to avoid blocking the event loop should wrap this in asyncio.to_thread.
+    """
+    out: list[bytes] = []
+    for phrase in _BACKCHANNEL_PHRASES:
+        try:
+            audio = tts_model.generate(
+                text=phrase,
+                voice_clone_prompt=voice_prompt,
+                language="hi",
+                generation_config=OmniVoiceGenerationConfig(
+                    num_step=12, guidance_scale=2.0, t_shift=0.1,
+                    audio_chunk_threshold=600.0,
+                    postprocess_output=False,
+                ),
+            )[0]
+            if hasattr(audio, "cpu"):
+                audio = audio.cpu().numpy()
+            pcm = (np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0) * 32767.0).astype(np.int16)
+            out.append(pcm.tobytes())
+        except Exception as bc_err:
+            print(f"[Engine] backchannel synth failed for {phrase!r}: {bc_err}", flush=True)
+    return out
+
+
 class _ModelStore:
     """Singleton: loads heavy GPU models ONCE, reused across all WebSocket
     connections. Whisper is now lazy — only loaded when the active STT
@@ -146,11 +223,18 @@ class _ModelStore:
     from rechoosing convolution kernels between TTS turns. That allocator
     churn was the root of the inter-turn pitch drift."""
     _instance = None
+    _loaded: bool
+    asr_model: Any
+    _whisper_name: Optional[str]
+    tts_model: Any
+    voice_prompt: Any
+    backchannel_pcm: List[Any]
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._loaded = False
             cls._instance.asr_model = None
+            cls._instance._whisper_name = None
         return cls._instance
 
     def load(self):
@@ -173,6 +257,17 @@ class _ModelStore:
                 print(f"[Engine] use_deterministic_algorithms failed (continuing): {det_err}")
             self.tts_model = OmniVoice.from_pretrained("k2-fsa/OmniVoice", device_map="cuda:0", dtype=torch.float16, load_asr=False)
             self.voice_prompt = self.tts_model.create_voice_clone_prompt(ref_audio=REF_AUDIO_PATH, preprocess_prompt=True)
+            # Pre-synth short backchannels so the llm_worker can fire one
+            # instantly at the start of a turn without waiting for an
+            # OmniVoice round-trip. These kill the perceived 2-3s silence
+            # between user-stops-talking and AI-starts-talking — the real
+            # LLM reply still takes its full time, but the user hears
+            # *something* within ~50ms of their turn ending. This cache is
+            # tied to the DEFAULT voice (Ravi); when a session selects a
+            # different voice, WebAssistant regenerates its own copy so the
+            # backchannel matches the chosen speaker.
+            self.backchannel_pcm = synth_backchannels(self.tts_model, self.voice_prompt)
+            print(f"[Engine] Pre-synth {len(self.backchannel_pcm)} default backchannels ready.")
             self._loaded = True
             print("[Engine] TTS Loaded Successfully.")
         except Exception as e:
@@ -198,8 +293,8 @@ class _ModelStore:
             except Exception:
                 pass
         from faster_whisper import WhisperModel
-        print(f"[Engine] Loading Whisper ({model_name}) on cuda:0 ...", flush=True)
-        self.asr_model = WhisperModel(model_name, device="cuda", device_index=0, compute_type="int8_float16")
+        print(f"[Engine] Loading Whisper ({model_name}) on cuda:1 ...", flush=True)
+        self.asr_model = WhisperModel(model_name, device="cuda", device_index=1, compute_type="int8_float16")
         self._whisper_name = model_name
         print("[Engine] Whisper loaded.", flush=True)
         return self.asr_model
@@ -214,7 +309,7 @@ class _ModelStore:
         except Exception:
             pass
         self.asr_model = None
-        self._whisper_name = None
+        self._whisper_name: Optional[str] = None
         try:
             torch.cuda.empty_cache()
         except Exception:
@@ -262,11 +357,32 @@ class WebAssistant:
             "style": "authoritative, Indian, professional"
         }
         self.voice_prompt = _models.voice_prompt
+        # Pre-synth short acknowledgement PCMs. llm_worker plays one right as a
+        # turn starts so the user hears *something* in ~50ms instead of waiting
+        # 1.5-3s for LLM+TTS. Mirrors human backchanneling in conversation.
+        # Tied to the currently-loaded voice — regenerated by set_voice_prompt
+        # on switch so the "अच्छा" isn't in a different speaker than the reply.
+        self.backchannels: list[bytes] = list(getattr(_models, "backchannel_pcm", []) or [])
+        # Monotonic counter — a late-finishing regen task for an older voice
+        # must not overwrite a newer voice's backchannels if two switches
+        # happen quickly.
+        self._backchannel_gen = 0
+        # Smart-backchannel gating. Tracks the last time we actually emitted
+        # a backchannel so llm_worker can enforce a minimum gap between them.
+        # Without this, every user turn got an "अच्छा" and it started sounding
+        # robotic / nagging within a few exchanges.
+        self.last_backchannel_time = 0.0
+        # Utterance coalescer. ASR flushes on every ~1s pause, but a real
+        # sentence can contain 2-3 sub-second pauses; each flush would otherwise
+        # become its own LLM turn. These fields hold the pending fragments and
+        # the timer that commits them to llm_queue once the user truly stops.
+        self._pending_user_text = ""
+        self._coalesce_task: asyncio.Task | None = None
         self.initial_prompt = "Natural Hindi/Hinglish: नमस्ते, क्या हाल है? मैं ठीक हूँ। Hello, how are you?"
         # self.llm_model = LLM_MODEL # REMOVED: Now set from __init__
         self.is_running = True
         self.is_speaking = False
-        self.speaking_start_time = 0    # Track when AI starts speaking for barge-in grace period
+        self.speaking_start_time = 0.0    # Track when AI starts speaking for barge-in grace period
         self.interrupt_event = asyncio.Event()
         self.history = []
         self.asr_queue = asyncio.Queue()
@@ -288,6 +404,79 @@ class WebAssistant:
                 await self.event_handler(msg_type, data)
             except Exception as e:
                 print(f"[emit] {msg_type} dropped: {type(e).__name__}: {e}")
+
+    def _coalesce_user_text(self, fragment: str) -> None:
+        """Queue a transcript fragment and (re)start the debounce timer.
+
+        Each ASR flush calls this instead of llm_queue.put(). We append to a
+        buffer and schedule a COALESCE_SEC wait; any fragment landing before
+        the timer fires cancels it and starts a new one, so rapid-fire flushes
+        from mid-sentence pauses merge into a single LLM turn.
+        """
+        fragment = fragment.strip()
+        if not fragment:
+            return
+        if self._pending_user_text:
+            # Join with a space; ASR transcripts don't always end in punctuation,
+            # and the LLM handles whitespace-separated clauses fine.
+            self._pending_user_text = f"{self._pending_user_text} {fragment}"
+        else:
+            self._pending_user_text = fragment
+        # Cancel any in-flight debounce and start a fresh one.
+        if self._coalesce_task and not self._coalesce_task.done():
+            self._coalesce_task.cancel()
+        self._coalesce_task = asyncio.create_task(self._flush_coalesced())
+
+    async def _flush_coalesced(self) -> None:
+        """Wait COALESCE_SEC then commit the buffered user text to llm_queue.
+
+        Cancelled by _coalesce_user_text() whenever another fragment arrives,
+        so we only fire after the user has been silent for the full window.
+        """
+        try:
+            await asyncio.sleep(COALESCE_SEC)
+        except asyncio.CancelledError:
+            return
+        text = self._pending_user_text.strip()
+        self._pending_user_text = ""
+        if text:
+            print(f"[Engine] Putting to llm_queue: {text!r}", flush=True)
+            await self.llm_queue.put(text)
+
+    def set_voice_prompt(self, voice_prompt) -> None:
+        """Swap the active voice AND clear/regenerate backchannels to match.
+        Without the regen, the pre-synth "अच्छा" keeps playing in the old
+        (default Ravi) voice even after the user selected someone else —
+        audible as a brief wrong-speaker glitch before each reply.
+
+        The actual synth runs in a background thread so callers don't block
+        their WebSocket loop; backchannel emission is disabled until the new
+        batch is ready. A monotonic gen counter guards against a slower
+        regen from an older switch landing after a newer one."""
+        self.voice_prompt = voice_prompt
+        self._backchannel_gen += 1
+        gen = self._backchannel_gen
+        # Clear immediately so the llm_worker's `if self.backchannels` gate
+        # skips emission until the new-voice batch arrives. A brief gap
+        # (2-3 turns with no backchannel) is far better than emitting the
+        # old voice's "अच्छा" right before a new-voice reply.
+        self.backchannels = []
+
+        async def _regen():
+            try:
+                pcms = await asyncio.to_thread(synth_backchannels, self.tts_model, voice_prompt)
+                if self._backchannel_gen == gen:
+                    self.backchannels = pcms
+                    print(f"[Engine] Regenerated {len(pcms)} backchannels for new voice (gen={gen}).", flush=True)
+            except Exception as e:
+                print(f"[Engine] backchannel regen failed (gen={gen}): {e}", flush=True)
+
+        try:
+            asyncio.create_task(_regen())
+        except RuntimeError:
+            # No running loop (shouldn't happen from WS handler, but defensively):
+            # skip — backchannels will stay empty until next switch.
+            pass
 
     async def asr_worker(self):
         print("[ASR] Worker started.")
@@ -358,9 +547,6 @@ class WebAssistant:
                     elif peak > 0.01:
                         audio_16k = audio_16k * (0.1 / peak)
 
-                    padding = np.zeros(int(16000 * 0.2), dtype=np.float32)
-                    audio_padded = np.concatenate([padding, audio_16k, padding])
-
                     # Route through the active STT provider. sarvam (default)
                     # hits Sarvam's /speech-to-text endpoint; whisper uses the
                     # locally-loaded faster-whisper model. Pulled per-turn via
@@ -377,8 +563,19 @@ class WebAssistant:
                         await self.emit("log", "[ASR] No STT provider configured; dropping utterance")
                         text = ""
                     else:
+                        # Whisper's mel-spec wants ≥200ms of context or it
+                        # hallucinates on very short utterances. Sarvam cloud
+                        # handles short clips natively, so skip the 400ms of
+                        # padding there — it was turning every turn into an
+                        # extra ~200ms of Sarvam server time for no accuracy
+                        # gain.
+                        if isinstance(stt, LocalWhisperSTT):
+                            padding = np.zeros(int(16000 * 0.2), dtype=np.float32)
+                            audio_to_stt = np.concatenate([padding, audio_16k, padding])
+                        else:
+                            audio_to_stt = audio_16k
                         try:
-                            text = await stt.transcribe(audio_padded)
+                            text = await stt.transcribe(audio_to_stt)
                         except Exception as _e:
                             print(f"[ASR] transcribe error: {type(_e).__name__}: {_e}", flush=True)
                             text = ""
@@ -391,10 +588,14 @@ class WebAssistant:
                     if text and len(text) >= 1:
                         await self.emit("log", f"[ASR] Speech: {text}")
                         await self.emit("transcript", {"role": "user", "text": text})
-                        await self.llm_queue.put(text)
-                        
+                        # Queue for coalesced dispatch instead of firing the
+                        # LLM turn immediately — lets mid-sentence pauses
+                        # merge into one request.
+                        self._coalesce_user_text(text)
+
                         # Barge-in Interruption
                         self.interrupt_event.set()
+                        await self.emit("status", "interrupted")
                         self.is_speaking = False # Reset state immediately so next turn is sensitive
                         # Drain remaining TTS to stop immediately
                         while not self.tts_queue.empty(): self.tts_queue.get_nowait()
@@ -405,152 +606,171 @@ class WebAssistant:
                 print(f"ASR Error: {e}")
 
     async def llm_worker(self):
-        print("[LLM] Worker started.")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            while self.is_running:
-                user_text = await self.llm_queue.get()
-                # Fresh turn: clear any stale interrupt flag set by ASR's
-                # barge-in signal, otherwise the stream loop below exits on
-                # the very first chunk and the user gets silence.
-                self.interrupt_event.clear()
-                # Per-turn provider refresh: picks up a /provider/switch that
-                # happened mid-session without forcing a WebSocket reconnect.
-                if self.get_provider is not None:
-                    try:
-                        p = self.get_provider()
-                        if p is not None:
-                            self.llm_url = p.url
-                            self.llm_model = p.model
-                            self.llm_headers = p.headers()
-                            self.llm_extras = p.payload_extras()
-                    except Exception as _e:
-                        print(f"[LLM] get_provider error: {_e}", flush=True)
-                # Per-turn campaign refresh so a /campaign PUT takes effect on
-                # the next user turn without reopening the WebSocket.
-                campaign = None
-                if self.get_campaign is not None:
-                    try:
-                        campaign = self.get_campaign()
-                    except Exception as _e:
-                        print(f"[LLM] get_campaign error: {_e}", flush=True)
-                if campaign is None:
-                    campaign = load_campaign()
-                system_prompt = build_system_prompt(
-                    campaign,
-                    voice_name=self.active_voice_metadata.get("name", "AI"),
-                    voice_gender=self.active_voice_metadata.get("gender", "male"),
-                )
-                # Diag: prove the worker is alive and seeing new turns.
-                print(f"[LLM] dequeued turn: {user_text!r} (url={self.llm_url}, model={self.llm_model}) campaign={campaign.get('label') if campaign else None!r}", flush=True)
-                payload = {
-                    "model": self.llm_model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        *self.history[-10:],  # last 10 exchanges for context
-                        {"role": "user", "content": user_text},
-                    ],
-                    "stream": True,
-                }
-                # Per-provider request shape (Ollama's `options` dict vs
-                # Sarvam's top-level OpenAI fields). Merged last so an override
-                # wins over the legacy defaults.
-                legacy_options = {"num_predict": 128, "temperature": 0.5}
-                if self.llm_extras:
-                    payload.update(self.llm_extras)
-                else:
-                    payload["options"] = legacy_options
-                sentence = ""
-                full_response = ""
-                is_first_chunk = True
-                # Stream-safe <think>...</think> filter state. Sarvam-M/30B can
-                # still emit reasoning wrapped in <think> tags in some turns
-                # even with reasoning_effort=null — this buffer makes sure no
-                # such content ever reaches TTS. Keyed per turn.
-                think_state = {"in_think": False, "tail": ""}
-                print(f"[LLM] pre-emit status=thinking", flush=True)
-                await self.emit("status", "thinking")
-                print(f"[LLM] post-emit status=thinking; opening stream to {self.llm_url}", flush=True)
-                try:
-                    async with client.stream("POST", self.llm_url, json=payload, headers=self.llm_headers or None) as response:
-                        async for line in response.aiter_lines():
-                            if self.interrupt_event.is_set():
-                                await self.emit("status", "interrupted")
-                                break
-                            if line.startswith("data: "):
-                                if "[DONE]" in line: break
+        print("[LLM] Worker started.", flush=True)
+        while self.is_running:
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    print("[LLM] HEARTBEAT: Ready and waiting for turns...", flush=True)
+                    while self.is_running:
+                        user_text = await self.llm_queue.get()
+                        try:
+                            # Fresh turn: clear any stale interrupt flag
+                            self.interrupt_event.clear()
+                            print(f"[LLM] dequeued turn: {user_text!r}", flush=True)
+                            
+                            # Per-turn provider refresh
+                            p = None
+                            if self.get_provider is not None:
                                 try:
-                                    body = json.loads(line[6:])
-                                except json.JSONDecodeError:
+                                    p = self.get_provider()
+                                    if p is not None:
+                                        self.llm_url = p.url
+                                        self.llm_model = p.model
+                                        self.llm_headers = p.headers()
+                                        self.llm_extras = p.payload_extras()
+                                except Exception as _e:
+                                    print(f"[LLM] get_provider error: {_e}", flush=True)
+
+                            # Per-turn campaign refresh
+                            campaign = None
+                            if self.get_campaign is not None:
+                                try:
+                                    campaign = self.get_campaign()
+                                except Exception:
+                                    pass
+                            if campaign is None:
+                                campaign = load_campaign()
+                            
+                            system_prompt = build_system_prompt(
+                                campaign,
+                                voice_name=self.active_voice_metadata.get("name", "AI"),
+                                voice_gender=self.active_voice_metadata.get("gender", "male"),
+                                voice_metadata=self.active_voice_metadata,
+                            )
+                            
+                            print(f"[LLM] SYSTEM PROMPT REPR (len={len(system_prompt)}): {repr(system_prompt)[:160]}...", flush=True)
+
+                            user_msg: Dict[str, Any] = {"role": "user", "content": user_text}
+                            messages: List[Dict[str, Any]] = self.history[-10:] + [user_msg]
+                            
+                            payload: Dict[str, Any]
+                            if p is not None:
+                                payload = p.build_payload(system_prompt, messages=messages)
+                            else:
+                                payload = {"messages": messages, "stream": True, "model": self.llm_model}
+                            
+                            if self.llm_extras:
+                                payload.update(self.llm_extras)
+                            
+                            # Enforce conversational brevity for KCR mode
+                            voice_id_check = self.active_voice_metadata.get("id", "").lower()
+                            voice_name_check = self.active_voice_metadata.get("name", "").lower()
+                            if "kcr" in voice_id_check or "kcr" in voice_name_check:
+                                opts = payload.get("options", {})
+                                if isinstance(opts, dict):
+                                    opts["num_predict"] = 128
+                                    payload["options"] = opts
+                                else:
+                                    payload["max_tokens"] = 128
+
+                            sentence = ""
+                            full_response = ""
+                            think_state = {"in_think": False, "tail": ""}
+                            await self.emit("status", "thinking")
+
+                            # Smart backchannel gating
+                            now = time.time()
+                            gap_ok = (now - self.last_backchannel_time) >= BACKCHANNEL_MIN_GAP_SEC
+                            len_ok = len(user_text.strip()) >= BACKCHANNEL_MIN_UTTERANCE_LEN
+                            roll_ok = random.random() < BACKCHANNEL_PROBABILITY
+                            if bool(self.backchannels) and not self.interrupt_event.is_set() and gap_ok and len_ok and roll_ok:
+                                try:
+                                    bc = random.choice(self.backchannels)
+                                    self.is_speaking = True
+                                    await self.emit("status", "speaking")
+                                    await self.emit("audio_chunk", bc)
+                                    self.last_backchannel_time = now
+                                except Exception as bc_err:
+                                    print(f"[LLM] backchannel emit failed: {bc_err}", flush=True)
+
+                            sentence_end_re = re.compile(r"(\n\n)")
+                            print(f"[LLM] Starting stream request to: {self.llm_url} (model={self.llm_model})", flush=True)
+                            async with client.stream("POST", self.llm_url, json=payload, headers=self.llm_headers or None) as response:
+                                if response.status_code != 200:
+                                    err_body = await response.aread()
+                                    print(f"[LLM] API ERROR (status={response.status_code}) url={self.llm_url}: {err_body.decode(errors='ignore')}", flush=True)
+                                    await self.emit("log", f"[LLM] API Error: {response.status_code}")
+                                    await self.emit("status", "idle")
                                     continue
-                                choices = body.get("choices") or []
-                                if not choices:
-                                    # Sarvam occasionally sends keep-alive frames
-                                    # with empty choices; skip without crashing.
-                                    continue
-                                delta = choices[0].get("delta") or {}
-                                raw_chunk = delta.get("content") or ""
-                                # Also skip any `reasoning_content` delta some
-                                # reasoning-capable backends emit on the side —
-                                # we never want it spoken.
-                                chunk = _strip_think_streaming(raw_chunk, think_state)
-                                if not chunk:
-                                    continue
-                                sentence += chunk
-                                full_response += chunk
-                                await self.emit("llm_chunk", chunk)
-                                # NOTE: per-sentence TTS flush removed. The
-                                # lab server synthesizes the whole phrase in a
-                                # single generate() call and has no pitch
-                                # drift; the engine used to split on .?!।
-                                # which made each sentence an independent
-                                # generate() pass, and OmniVoice's prosody
-                                # planner picks a fresh pitch center every
-                                # call. Seeding didn't help because seeding
-                                # only pins diffusion noise, not the planner.
-                                # We now buffer the full response and synth
-                                # once at end-of-stream (see flush below).
-                    # End-of-stream: flush the think-filter's hold buffer. It
-                    # carries up to 7 chars of lookahead we use to catch tags
-                    # split across chunks; at stream end those chars are safe
-                    # to emit (we're guaranteed no more tag can begin there).
-                    if not think_state["in_think"] and think_state["tail"]:
-                        trailing = think_state["tail"]
-                        think_state["tail"] = ""
-                        sentence += trailing
-                        full_response += trailing
-                        await self.emit("llm_chunk", trailing)
-                    # Single-shot synth: send the entire response as one TTS
-                    # job. Matches tts_lab/server.py's behaviour and keeps
-                    # pitch consistent across the whole turn. Trade-off: first
-                    # audio lands ~200-400ms later than the old chunked path,
-                    # but prompts are capped to 2 sentences (campaigns.json
-                    # max_sentences_per_turn) so a single call stays well
-                    # under OmniVoice's 15s audio_chunk_duration budget.
-                    if not self.interrupt_event.is_set():
-                        whole = clean_text(full_response)
-                        if whole:
-                            await self.tts_queue.put(whole)
-                            is_first_chunk = False
-                    await self.tts_queue.put("__END_RESPONSE__")
-                    
-                    display_text = full_response
-                    def ui_whitelist(match):
-                        content = match.group(1).lower().strip()
-                        mapping = {"हँसी": "laughter", "हंसी": "laughter", "haha": "laughter", "आह": "sigh", "स्निफ़": "sniff", "हम्म": "dissatisfaction-hnn"}
-                        val = mapping.get(content, content)
-                        return f"[{val}]" if val in ["laughter", "sigh", "sniff", "dissatisfaction-hnn"] else ""
-                    display_text = re.sub(r'\[(.*?)\]', ui_whitelist, display_text)
-                    await self.emit("transcript", {"role": "ai", "text": display_text})
-                    
-                    # Store in history for better intelligence in next turn
-                    self.history.append({"role": "user", "content": user_text})
-                    self.history.append({"role": "assistant", "content": full_response})
-                    if len(self.history) > 20: # Keep memory lean
-                        self.history = self.history[-20:]
-                except Exception as e:
-                    import traceback
-                    print(f"LLM Error: {type(e).__name__}: {e}")
-                    traceback.print_exc()
+
+                                async for line in response.aiter_lines():
+                                    if not line.strip(): continue
+                                    if self.interrupt_event.is_set():
+                                        await self.emit("status", "interrupted")
+                                        break
+                                    
+                                    if line.startswith("data: "):
+                                        if "[DONE]" in line: break
+                                        try:
+                                            body = json.loads(line[6:])
+                                        except json.JSONDecodeError:
+                                            continue
+                                    else:
+                                        continue
+
+                                    choices = body.get("choices") or []
+                                    if not choices: continue
+                                    delta = choices[0].get("delta") or {}
+                                    raw_chunk = delta.get("content") or ""
+                                    chunk = _strip_think_streaming(raw_chunk, think_state)
+                                    if not chunk: continue
+                                    
+                                    sentence += chunk
+                                    full_response += chunk
+                                    await self.emit("llm_chunk", chunk)
+                                    
+                                    while True:
+                                        m = sentence_end_re.search(sentence)
+                                        if not m: break
+                                        end = m.end()
+                                        part = sentence[:end].strip()
+                                        sentence = sentence[end:]
+                                        if part and not self.interrupt_event.is_set():
+                                            cleaned = clean_text(part)
+                                            if cleaned:
+                                                await self.tts_queue.put(cleaned)
+
+                            # End of stream flush
+                            if think_state["in_think"]:
+                                await self.emit("log", "[LLM] Model response was entirely reasoning block.")
+                            if not think_state["in_think"] and think_state["tail"]:
+                                sentence += think_state["tail"]
+                                full_response += think_state["tail"]
+                                await self.emit("llm_chunk", think_state["tail"])
+                            
+                            tail = sentence.strip()
+                            if tail and not self.interrupt_event.is_set():
+                                cleaned = clean_text(tail)
+                                if cleaned:
+                                    await self.tts_queue.put(cleaned)
+                            
+                            await self.tts_queue.put("__END_RESPONSE__")
+                            await self.emit("transcript", {"role": "ai", "text": full_response.strip()})
+                            
+                            if full_response.strip():
+                                self.history.append({"role": "user", "content": user_text})
+                                self.history.append({"role": "assistant", "content": full_response})
+                                if len(self.history) > 20: self.history = self.history[-20:]
+                            else:
+                                await self.emit("log", "[LLM] Empty response from model")
+                                
+                        except Exception as e:
+                            print(f"LLM Turn Error: {type(e).__name__}: {e}")
+                            traceback.print_exc()
+            except Exception as outer_e:
+                print(f"LLM Outer Worker Error: {outer_e}")
+                traceback.print_exc()
+                await asyncio.sleep(2)
 
     async def tts_worker(self):
         """Lab-parity TTS worker.
@@ -578,7 +798,23 @@ class WebAssistant:
                 if not cleaned_text: continue
 
                 text_sha = hashlib.sha1(cleaned_text.encode("utf-8")).hexdigest()[:10]
-                print(f"[TTS] Synthesizing (text_sha={text_sha}): {cleaned_text}")
+                # Dynamic prosody: pick guidance_scale by text shape so the
+                # voice doesn't sound monotonic turn after turn. Lower scale
+                # → looser prosody, more natural/expressive; higher scale →
+                # tighter, more committed-sounding delivery. 2.0 is the lab
+                # default; we bias up for long replies (hold structure across
+                # a paragraph) and down for short acks / emotive tags.
+                tl = len(cleaned_text)
+                has_emote = any(tag in cleaned_text for tag in ("[laughter]", "[sigh]", "[sniff]", "[dissatisfaction-hnn]"))
+                if has_emote:
+                    guidance = 1.6
+                elif tl < 40:
+                    guidance = 1.8
+                elif tl > 120:
+                    guidance = 2.2
+                else:
+                    guidance = 2.0
+                print(f"[TTS] Synthesizing (text_sha={text_sha} guidance={guidance}): {cleaned_text}")
                 try:
                     def _lab_generate():
                         # Pin every RNG right before sampling so the diffusion
@@ -597,7 +833,7 @@ class WebAssistant:
                             language="hi",
                             generation_config=OmniVoiceGenerationConfig(
                                 num_step=12,
-                                guidance_scale=2.0,
+                                guidance_scale=guidance,
                                 t_shift=0.1,
                                 # Disable internal _generate_chunked: default
                                 # audio_chunk_duration is 15s, so any reply

@@ -1,6 +1,6 @@
 "use client";
 
-import { History, Plus, Menu, Settings, Zap, Trash2, MessageSquare } from "lucide-react";
+import { History, Plus, Menu, Settings, Zap, Trash2, MessageSquare, Layers } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useMemo } from "react";
 
@@ -17,6 +17,7 @@ interface SidebarProps {
   onToggle: () => void;
   onNewChat: () => void;
   onSettingsClick: () => void;
+  onCampaignClick: () => void;
   sessions: ChatSession[];
   activeSessionId: string | null;
   onSelectSession: (id: string) => void;
@@ -51,6 +52,7 @@ export default function Sidebar({
   onToggle,
   onNewChat,
   onSettingsClick,
+  onCampaignClick,
   sessions,
   activeSessionId,
   onSelectSession,
@@ -168,6 +170,14 @@ export default function Sidebar({
 
       {/* Footer */}
       <div className="p-4 mt-auto border-t border-white/5 flex flex-col gap-2 pb-4">
+        <button
+          onClick={onCampaignClick}
+          className={`w-full flex items-center gap-4 p-2.5 rounded-xl hover:bg-white/5 transition-colors group ${isCollapsed ? "justify-center" : ""}`}
+        >
+          <Layers className="w-4 h-4 text-slate-500 group-hover:text-slate-300 shrink-0" />
+          {!isCollapsed && <span className="text-sm text-slate-400 font-medium">Templates & Behavior</span>}
+        </button>
+
         <button
           onClick={onSettingsClick}
           className={`w-full flex items-center gap-4 p-2.5 rounded-xl hover:bg-white/5 transition-colors group ${isCollapsed ? "justify-center" : ""}`}

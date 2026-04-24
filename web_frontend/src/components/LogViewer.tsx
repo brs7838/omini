@@ -9,9 +9,21 @@ interface LogEntry {
   timestamp: number;
 }
 
-export default function LogViewer() {
+interface PhoneMessage {
+  role: "user" | "ai";
+  text: string;
+}
+
+interface LogViewerProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onPhoneMessage?: (msg: PhoneMessage) => void;
+}
+
+import { AnimatePresence, motion } from "framer-motion";
+
+export default function LogViewer({ isOpen, onClose, onPhoneMessage }: LogViewerProps) {
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [isOpen, setIsOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -35,6 +47,10 @@ export default function LogViewer() {
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
         setLogs((prev) => [...prev.slice(-199), msg]); // Keep last 200 logs
+        if (onPhoneMessage && typeof msg.data === "string") {
+          if (msg.type === "phone_user") onPhoneMessage({ role: "user", text: msg.data });
+          else if (msg.type === "phone_ai") onPhoneMessage({ role: "ai", text: msg.data });
+        }
       };
       ws.onclose = () => {
         setTimeout(connect, 3000); // Reconnect
@@ -68,20 +84,15 @@ export default function LogViewer() {
     }
   };
 
-  if (!isOpen) {
-    return (
-      <button 
-        onClick={() => setIsOpen(true)}
-        className="fixed bottom-6 right-6 p-3 bg-zinc-900/80 border border-white/10 rounded-full hover:bg-zinc-800 transition-all shadow-xl group z-50"
-        title="Open Live Logs"
-      >
-        <Terminal className="w-5 h-5 text-green-400 group-hover:scale-110 transition-transform" />
-      </button>
-    );
-  }
-
   return (
-    <div className="fixed bottom-6 right-6 w-96 h-[450px] bg-black/90 border border-white/10 rounded-xl shadow-2xl flex flex-col overflow-hidden z-50 backdrop-blur-xl animate-in slide-in-from-bottom-5 duration-300">
+    <AnimatePresence>
+      {isOpen && (
+        <motion.div
+          initial={{ opacity: 0, scale: 0.95, y: 10 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          exit={{ opacity: 0, scale: 0.95, y: 10 }}
+          className="absolute bottom-full mb-4 right-0 w-96 h-[450px] z-[60] bg-black/90 border border-white/10 rounded-xl shadow-2xl flex flex-col overflow-hidden backdrop-blur-xl"
+        >
       <div className="flex items-center justify-between px-4 py-3 border-b border-white/10 bg-zinc-900/50">
         <div className="flex items-center gap-2">
           <ScrollText className="w-4 h-4 text-green-400" />
@@ -95,7 +106,7 @@ export default function LogViewer() {
           >
             {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
           </button>
-          <button onClick={() => setIsOpen(false)} className="hover:text-red-400 text-white/40 transition-colors">
+          <button onClick={onClose} className="hover:text-red-400 text-white/40 transition-colors">
             <XCircle className="w-5 h-5" />
           </button>
         </div>
@@ -124,13 +135,9 @@ export default function LogViewer() {
           <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
           <span className="text-[9px] font-mono text-white/40 uppercase tracking-tight">Stream Active</span>
         </div>
-        <button 
-          onClick={() => setLogs([])}
-          className="text-[9px] uppercase font-bold text-white/30 hover:text-white transition-colors"
-        >
-          Clear
-        </button>
       </div>
-    </div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }

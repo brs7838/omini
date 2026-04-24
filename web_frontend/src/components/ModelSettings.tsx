@@ -9,7 +9,7 @@ interface Model {
   name: string;
 }
 
-type ProviderName = "ollama" | "sarvam";
+type ProviderName = "ollama" | "sarvam" | "minimax";
 
 interface ProviderState {
   provider: ProviderName;
@@ -48,6 +48,14 @@ export default function ModelSettings({ isOpen, onClose, onSelect, activeModelId
         { id: "sarvam-105b", name: "Sarvam 105B - Flagship" },
       ];
     }
+    if (provider === "minimax") {
+      return [
+        { id: "MiniMax-M2.5",             name: "MiniMax M2.5 - Thinking" },
+        { id: "MiniMax-M2.7",             name: "MiniMax M2.7 - Thinking" },
+        { id: "MiniMax-M2.5-non-thinking", name: "MiniMax M2.5 - Non-Thinking" },
+        { id: "MiniMax-M2.7-non-thinking", name: "MiniMax M2.7 - Non-Thinking" },
+      ];
+    }
     return [
       { id: "gemma3:4b",                  name: "Gemma 3 (4B) - Default" },
       { id: "qwen2:7b",                   name: "Qwen 2 (7B) - High IQ" },
@@ -80,7 +88,12 @@ export default function ModelSettings({ isOpen, onClose, onSelect, activeModelId
     }
   }, [viewedProvider, fetchModelsFor]);
 
-  useEffect(() => { if (isOpen) refreshAll(); }, [isOpen, refreshAll]);
+  useEffect(() => {
+    if (isOpen) {
+      const t = setTimeout(() => refreshAll(), 0);
+      return () => clearTimeout(t);
+    }
+  }, [isOpen, refreshAll]);
 
   // Tab click = filter-only; no backend call, no switch, no VRAM reload.
   const handleViewProvider = async (target: ProviderName) => {
@@ -130,7 +143,7 @@ export default function ModelSettings({ isOpen, onClose, onSelect, activeModelId
   return (
     <AnimatePresence>
       {isOpen && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+        <div className="absolute inset-0 z-[100] flex items-center justify-center p-4 pointer-events-auto">
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -143,7 +156,7 @@ export default function ModelSettings({ isOpen, onClose, onSelect, activeModelId
             initial={{ opacity: 0, scale: 0.9, y: 20 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.9, y: 20 }}
-            className="relative w-full max-w-md bg-slate-900/90 border border-white/10 rounded-3xl shadow-2xl p-6 overflow-hidden"
+            className="relative w-full max-w-lg bg-slate-900/90 border border-white/10 rounded-3xl shadow-2xl p-6 overflow-hidden max-h-full flex flex-col"
           >
             <div className="flex items-center justify-between mb-6">
               <div className="flex items-center gap-3">
@@ -172,7 +185,7 @@ export default function ModelSettings({ isOpen, onClose, onSelect, activeModelId
                   </span>
                 )}
               </div>
-              <div className="grid grid-cols-2 gap-2 p-1 rounded-2xl bg-white/[0.03] border border-white/5">
+              <div className="grid grid-cols-3 gap-2 p-1 rounded-2xl bg-white/[0.03] border border-white/5">
                 <ProviderPill
                   active={viewedProvider === "ollama"}
                   isBackendActive={providerState?.provider === "ollama"}
@@ -191,6 +204,16 @@ export default function ModelSettings({ isOpen, onClose, onSelect, activeModelId
                   icon={<Cloud className="w-3.5 h-3.5" />}
                   label="Sarvam"
                   sub="Cloud API"
+                  accent="indigo"
+                />
+                <ProviderPill
+                  active={viewedProvider === "minimax"}
+                  isBackendActive={providerState?.provider === "minimax"}
+                  loading={false}
+                  onClick={() => handleViewProvider("minimax")}
+                  icon={<Zap className="w-3.5 h-3.5" />}
+                  label="MiniMax"
+                  sub="High Speed"
                   accent="indigo"
                 />
               </div>

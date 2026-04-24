@@ -29,9 +29,12 @@ export default function SttChip() {
   };
 
   useEffect(() => {
-    fetchStt();
-    timerRef.current = setInterval(fetchStt, POLL_MS);
+    const t = setTimeout(() => {
+      fetchStt();
+      timerRef.current = setInterval(fetchStt, POLL_MS);
+    }, 0);
     return () => {
+      clearTimeout(t);
       if (timerRef.current) clearInterval(timerRef.current);
     };
   }, []);
@@ -119,7 +122,7 @@ export default function SttChip() {
       </button>
 
       {open && (
-        <div className="absolute bottom-full mb-2 left-0 min-w-[220px] bg-slate-950/95 border border-white/10 rounded-xl shadow-2xl backdrop-blur-xl p-1.5 z-50">
+        <div className="absolute top-full mt-2 left-0 min-w-[220px] bg-slate-950/95 border border-white/10 rounded-xl shadow-2xl backdrop-blur-xl p-1.5 z-50">
           <div className="px-2.5 py-1.5 text-[9px] font-bold uppercase tracking-[0.18em] text-slate-500">
             STT Backend
           </div>

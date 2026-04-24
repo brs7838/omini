@@ -13,6 +13,8 @@ export function useVoice(activeVoiceId: string = "ravi") {
   const [state, setState] = useState<AssistantState>("idle");
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLive, setIsLive] = useState(false);
+  const [isMicMuted, setIsMicMuted] = useState(false);
+  const isMicMutedRef = useRef(false);
   const [isCloud, setIsCloud] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -37,6 +39,12 @@ export function useVoice(activeVoiceId: string = "ravi") {
   // Active <audio> elements playing current TTS blobs — tracked so barge-in /
   // interrupt can stop them immediately.
   const activePlaybackElsRef = useRef<HTMLAudioElement[]>([]);
+  // Pending playback URLs waiting for the current element to finish. Populated
+  // by sentence-streaming TTS: the backend now emits one audio_chunk per
+  // completed sentence instead of one per turn, so we must play them in
+  // sequence rather than canceling the previous one each time.
+  const playbackQueueRef = useRef<string[]>([]);
+  const isPlayingRef = useRef<boolean>(false);
 
   // Wrap int16 PCM samples (mono, little-endian) in a minimal RIFF/WAVE header
   // so the browser's native audio decoder interprets them at the stated rate.
@@ -70,10 +78,11 @@ export function useVoice(activeVoiceId: string = "ravi") {
     return new Blob([buf], { type: "audio/wav" });
   };
 
-  // Hard-stop all currently-playing TTS elements. `pause()` alone is not
-  // always sufficient to halt an <audio> element that has an in-flight blob
-  // decoder — detaching `src` + `load()` drops the media resource and frees
-  // buffered samples so there's no audible tail after barge-in or a new reply.
+  // Hard-stop all currently-playing TTS elements AND drain the pending queue.
+  // `pause()` alone is not always sufficient to halt an <audio> element that
+  // has an in-flight blob decoder — detaching `src` + `load()` drops the media
+  // resource and frees buffered samples so there's no audible tail after
+  // barge-in. Called on interrupt / stop — NOT between normal sentences.
   const stopAllPlayback = () => {
     activePlaybackElsRef.current.forEach(el => {
       try {
@@ -83,44 +92,56 @@ export function useVoice(activeVoiceId: string = "ravi") {
       } catch { /* element may already be detached */ }
     });
     activePlaybackElsRef.current = [];
+    playbackQueueRef.current.forEach(u => {
+      try { URL.revokeObjectURL(u); } catch { }
+    });
+    playbackQueueRef.current = [];
+    isPlayingRef.current = false;
   };
 
-  // --- Audio playback (declared before connect so it can be referenced) ---
-  const playSerializedAudio = useCallback(async (data: Blob, sampleRate: number) => {
-    // Kill any previous reply's playback before starting this one. Without
-    // this, a delayed "interrupted" event or a quick back-to-back turn let
-    // the old <audio> element bleed into the first ~second of the new one —
-    // audible as a brief voice overlap at the start of each reply.
-    stopAllPlayback();
-
-    const pcmBuffer = await data.arrayBuffer();
-    const wavBlob = pcmToWavBlob(pcmBuffer, sampleRate);
-    const url = URL.createObjectURL(wavBlob);
-
+  // Play one URL end-to-end, then recurse into the queue. Chained with onended
+  // so sentences from the same turn play back-to-back without a cancellation
+  // gap — this is what makes streaming TTS feel like one continuous reply
+  // instead of a staccato sequence.
+  const playNextInQueue = useCallback(function playNext() {
+    const url = playbackQueueRef.current.shift();
+    if (!url) {
+      isPlayingRef.current = false;
+      setState(prev => (prev === "speaking" ? "idle" : prev));
+      return;
+    }
+    isPlayingRef.current = true;
     const el = new Audio();
     el.src = url;
     el.autoplay = true;
     el.preload = "auto";
-    // Explicit play() — autoplay alone isn't guaranteed to fire synchronously
-    // on every browser/version, and we want playback to start the moment the
-    // blob is ready so replies aren't perceived as laggy.
     el.play().catch(err => console.warn("[Audio] play() rejected:", err));
-
     activePlaybackElsRef.current.push(el);
     const cleanup = () => {
-      URL.revokeObjectURL(url);
+      try { URL.revokeObjectURL(url); } catch { }
       activePlaybackElsRef.current = activePlaybackElsRef.current.filter(a => a !== el);
-      // If nothing else is playing, drop back to idle so the UI mic reopens.
-      if (activePlaybackElsRef.current.length === 0) {
-        setState(prev => (prev === "speaking" ? "idle" : prev));
-      }
+      playNext();
     };
     el.onended = cleanup;
     el.onerror = cleanup;
-
-    console.log(`[Audio] Playing WAV blob: ${(pcmBuffer.byteLength / 2 / sampleRate).toFixed(3)}s`);
     setState("speaking");
   }, []);
+
+  // --- Audio playback (declared before connect so it can be referenced) ---
+  // Enqueue a PCM chunk for sequential playback. Backend streams each
+  // completed sentence as its own audio_chunk (plus an optional backchannel
+  // at turn start), so enqueue-and-chain is the right pattern. Barge-in /
+  // interrupt clears the queue via stopAllPlayback().
+  const playSerializedAudio = useCallback(async (data: Blob, sampleRate: number) => {
+    const pcmBuffer = await data.arrayBuffer();
+    const wavBlob = pcmToWavBlob(pcmBuffer, sampleRate);
+    const url = URL.createObjectURL(wavBlob);
+    playbackQueueRef.current.push(url);
+    console.log(`[Audio] Queued WAV blob: ${(pcmBuffer.byteLength / 2 / sampleRate).toFixed(3)}s (pending=${playbackQueueRef.current.length})`);
+    if (!isPlayingRef.current) {
+      playNextInQueue();
+    }
+  }, [playNextInQueue]);
 
   // --- WebSocket connection ---
   const connect = useCallback((cloud: boolean) => {
@@ -314,14 +335,16 @@ export function useVoice(activeVoiceId: string = "ravi") {
           for (let i = 0; i < samples.length; i++) {
             pcmData[i] = Math.max(-1, Math.min(1, samples[i])) * 0x7FFF;
           }
-          wsRef.current.send(pcmData.buffer);
+          if (!isMicMutedRef.current) {
+            wsRef.current.send(pcmData.buffer);
+          }
 
           // Client-side "listening" fallback. Threshold lowered from 0.05 to 0.015
           // because autoGainControl is now OFF, so natural-volume speech peaks at
           // ~0.02-0.1 instead of AGC-boosted ~0.3-1.0. Backend Silero VAD also
           // emits an authoritative "listening" status; this local check just keeps
           // the orb feeling responsive on the first few ms of an utterance.
-          if (!isCloud) {
+          if (!isCloud && !isMicMutedRef.current) {
             if (peak > 0.015) {
               setState("listening");
             }
@@ -404,6 +427,13 @@ export function useVoice(activeVoiceId: string = "ravi") {
     else startStreaming();
   };
 
+  const toggleMic = () => {
+    setIsMicMuted((prev) => {
+      isMicMutedRef.current = !prev;
+      return !prev;
+    });
+  };
+
   const toggleCloud = () => {
     if (isLive) stopStreaming();
     setIsCloud(!isCloud);
@@ -428,5 +458,22 @@ export function useVoice(activeVoiceId: string = "ravi") {
     }
   };
 
-  return { state, messages, isLive, isCloud, toggleLive, toggleCloud, switchVoice, switchModel, resetChat };
+  const sendText = (text: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "text_input", text }));
+    } else {
+        // Auto-connect and send text when open
+        connect(isCloud);
+        const interval = setInterval(() => {
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+                wsRef.current.send(JSON.stringify({ type: "text_input", text }));
+                clearInterval(interval);
+            }
+        }, 100);
+        // Fallback: clear interval after 10s if connection fails
+        setTimeout(() => clearInterval(interval), 10000);
+    }
+  };
+
+  return { state, messages, isLive, isCloud, isMicMuted, toggleLive, toggleMic, toggleCloud, switchVoice, switchModel, resetChat, sendText };
 }

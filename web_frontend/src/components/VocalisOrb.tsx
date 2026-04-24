@@ -30,21 +30,27 @@ export default function VocalisOrb({ state }: VocalisOrbProps) {
 
     const resize = () => {
       const dpr = window.devicePixelRatio || 1;
-      canvas.width = canvas.clientWidth * dpr;
-      canvas.height = canvas.clientHeight * dpr;
+      // Get internal dimensions of canvas element bounding box
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // Reset and scale correctly
     };
 
-    window.addEventListener("resize", resize);
+    const observer = new ResizeObserver(() => resize());
+    observer.observe(canvas);
     resize();
 
     const draw = () => {
       time += state === "listening" ? 0.05 : 0.02;
       const { width, height } = canvas.getBoundingClientRect();
+      if (width === 0 || height === 0) return;
+      
       ctx.clearRect(0, 0, width, height);
 
       const center = { x: width / 2, y: height / 2 };
-      const baseRadius = width * 0.3;
+      const baseRadius = Math.min(width, height) * 0.3;
       const targetColor = colors[state];
 
       // Layered Glow Effect
@@ -103,7 +109,7 @@ export default function VocalisOrb({ state }: VocalisOrbProps) {
     draw();
 
     return () => {
-      window.removeEventListener("resize", resize);
+      observer.disconnect();
       cancelAnimationFrame(animationFrameId);
     };
   }, [state]);
