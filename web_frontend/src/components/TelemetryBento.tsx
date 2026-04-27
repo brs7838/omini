@@ -30,9 +30,11 @@ interface SysStatus {
 
 interface TelemetryBentoProps {
   onPhoneMessage?: (msg: { role: "user" | "ai"; text: string }) => void;
+  onPhoneAiPartial?: (text: string) => void;
+  onPhoneTtsSpeaking?: (text: string) => void;
 }
 
-export default function TelemetryBento({ onPhoneMessage }: TelemetryBentoProps) {
+export default function TelemetryBento({ onPhoneMessage, onPhoneAiPartial, onPhoneTtsSpeaking }: TelemetryBentoProps) {
   const [activeTab, setActiveTab] = useState<"logs" | "sys">("sys");
 
   // System State
@@ -42,6 +44,14 @@ export default function TelemetryBento({ onPhoneMessage }: TelemetryBentoProps) 
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
+
+  // Stable refs for callbacks so the WS effect doesn't reconnect on re-renders
+  const onPhoneMessageRef = useRef(onPhoneMessage);
+  const onPhoneAiPartialRef = useRef(onPhoneAiPartial);
+  const onPhoneTtsSpeakingRef = useRef(onPhoneTtsSpeaking);
+  useEffect(() => { onPhoneMessageRef.current = onPhoneMessage; }, [onPhoneMessage]);
+  useEffect(() => { onPhoneAiPartialRef.current = onPhoneAiPartial; }, [onPhoneAiPartial]);
+  useEffect(() => { onPhoneTtsSpeakingRef.current = onPhoneTtsSpeaking; }, [onPhoneTtsSpeaking]);
 
   useEffect(() => {
     let interval: NodeJS.Timeout;
@@ -65,9 +75,11 @@ export default function TelemetryBento({ onPhoneMessage }: TelemetryBentoProps) 
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
         setLogs((prev) => [...prev.slice(-199), msg]);
-        if (onPhoneMessage && typeof msg.data === "string") {
-          if (msg.type === "phone_user") onPhoneMessage({ role: "user", text: msg.data });
-          else if (msg.type === "phone_ai") onPhoneMessage({ role: "ai", text: msg.data });
+        if (typeof msg.data === "string") {
+          if (msg.type === "phone_user") onPhoneMessageRef.current?.({ role: "user", text: msg.data });
+          else if (msg.type === "phone_ai") onPhoneMessageRef.current?.({ role: "ai", text: msg.data });
+          else if (msg.type === "phone_ai_partial") onPhoneAiPartialRef.current?.(msg.data);
+          else if (msg.type === "phone_tts_speaking") onPhoneTtsSpeakingRef.current?.(msg.data);
         }
       };
       ws.onclose = () => { setTimeout(connect, 3000); };
@@ -75,7 +87,7 @@ export default function TelemetryBento({ onPhoneMessage }: TelemetryBentoProps) 
     };
     connect();
     return () => wsRef.current?.close();
-  }, [onPhoneMessage]);
+  }, []);
 
   useEffect(() => {
     if (activeTab === "logs" && scrollRef.current) {

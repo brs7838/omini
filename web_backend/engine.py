@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio
 import collections
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, cast
 import sys
 import os
 import traceback
@@ -651,7 +651,7 @@ class WebAssistant:
                             print(f"[LLM] SYSTEM PROMPT REPR (len={len(system_prompt)}): {repr(system_prompt)[:160]}...", flush=True)
 
                             user_msg: Dict[str, Any] = {"role": "user", "content": user_text}
-                            messages: List[Dict[str, Any]] = self.history[-10:] + [user_msg]
+                            messages: List[Dict[str, Any]] = self.history[-30:] + [user_msg]
                             
                             payload: Dict[str, Any]
                             if p is not None:
@@ -696,6 +696,7 @@ class WebAssistant:
                             sentence_end_re = re.compile(r"(\n\n)")
                             print(f"[LLM] Starting stream request to: {self.llm_url} (model={self.llm_model})", flush=True)
                             async with client.stream("POST", self.llm_url, json=payload, headers=self.llm_headers or None) as response:
+                                response = cast(httpx.Response, response)
                                 if response.status_code != 200:
                                     err_body = await response.aread()
                                     print(f"[LLM] API ERROR (status={response.status_code}) url={self.llm_url}: {err_body.decode(errors='ignore')}", flush=True)
@@ -760,7 +761,7 @@ class WebAssistant:
                             if full_response.strip():
                                 self.history.append({"role": "user", "content": user_text})
                                 self.history.append({"role": "assistant", "content": full_response})
-                                if len(self.history) > 20: self.history = self.history[-20:]
+                                if len(self.history) > 60: self.history = self.history[-60:]
                             else:
                                 await self.emit("log", "[LLM] Empty response from model")
                                 

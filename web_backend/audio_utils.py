@@ -9,8 +9,13 @@ def trim_audio_file(file_path, duration_sec=10):
         # Load audio (pydub handles mp3/wav if ffmpeg is present, otherwise simple wav)
         audio = AudioSegment.from_file(file_path)
         
+        # Explicitly check/cast to avoid 'Generator' type-check error
+        from typing import cast
+        if not isinstance(audio, AudioSegment):
+            audio = cast(AudioSegment, audio)
+
         # Trim to duration (in milliseconds)
-        trimmed = audio[:duration_sec * 1000]
+        trimmed = cast(AudioSegment, audio[:duration_sec * 1000])
         
         # Determine output path (.wav for best TTS compatibility)
         output_path = file_path.rsplit(".", 1)[0] + "_trimmed.wav"

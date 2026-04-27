@@ -21,8 +21,21 @@ import asyncio
 import sys
 import base64
 import time
-import psutil # For High-Priority scheduling
+import psutil  # type: ignore # For High-Priority scheduling
 from typing import Optional
+
+# Windows console is cp1252 by default; Devanagari (Hindi) prints would crash.
+try:
+    # Use getattr for safe access to 'reconfigure' without triggering type-checker
+    stdout_reconfig = getattr(sys.stdout, "reconfigure", None)
+    if stdout_reconfig:
+        stdout_reconfig(encoding="utf-8", errors="replace")
+        
+    stderr_reconfig = getattr(sys.stderr, "reconfigure", None)
+    if stderr_reconfig:
+        stderr_reconfig(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # Add project root and backend dir to sys.path for robust imports
 # This ensures that even if run from root, modules like 'engine' are found.
@@ -39,6 +52,8 @@ import uuid
 import shutil
 import audioop
 import httpx
+import numpy as np
+from omnivoice import OmniVoiceGenerationConfig
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -111,10 +126,10 @@ _log_file_queue: asyncio.Queue | None = None
 _LOG_QUEUE_MAX = 5000
 
 
-async def push_phone_transcript(role: str, text: str):
+async def push_phone_transcript(role: str, text: str, is_partial: bool = False):
     """Push a phone-call transcript line to all connected browser /ws clients."""
     clean = re.sub(r'\[.*?\]', '', text).strip()
-    payload = json.dumps({"type": "transcript", "data": {"role": role, "text": clean}})
+    payload = json.dumps({"type": "transcript", "data": {"role": role, "text": clean, "is_partial": is_partial}})
     dead = set()
     for client in list(voice_clients):
         try:
@@ -218,8 +233,6 @@ def _with_silence_prefix(ulaw: bytes, prefix_ms: int) -> bytes:
 
 def _synth_to_ulaw(text: str) -> bytes:
     """Fast TTS to u-law 8kHz via decimation."""
-    import numpy as np
-    from omnivoice import OmniVoiceGenerationConfig
     
     audio_list = _models.tts_model.generate(
         text=text,
@@ -238,12 +251,14 @@ def _synth_to_ulaw(text: str) -> bytes:
         audio_data = audio_data.cpu().numpy()
     audio_data = np.asarray(audio_data, dtype=np.float32)
     
-    # Direct 8kHz extraction (Decimation) - 3x faster than resampling
-    # 24kHz / 3 = 8kHz
-    audio_8k = audio_data[::3]
+    # Peak-Normalize and Scale to int16
+    pcm_24k = (np.clip(audio_data * 1.0, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
     
-    # Fast Linear Scaling & Volume Boost
-    pcm_8k = (np.clip(audio_8k * 1.4, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+    # Resample 24kHz -> 8kHz
+    pcm_8k, _ = audioop.ratecv(pcm_24k, 2, 1, 24000, 8000, None)
+    
+    # Boost for telephony
+    pcm_8k = audioop.mul(pcm_8k, 2, 1.4)
     
     return audioop.lin2ulaw(pcm_8k, 2)
 
@@ -477,7 +492,7 @@ async def hangup_call(channel_id: Optional[str] = None):
                 "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=no",
                 "pi@192.168.8.59",
-                "pkill", "-f", "vaani_bridge.py",
+                "pkill", "-9", "-f", "vaani_bridge.py",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -537,7 +552,10 @@ async def dial_number(req: DialRequest):
     # connects back to our /ws/phone for the AI pipeline.
     ssh_key = r"C:\Users\pc\.ssh\id_ed25519"
     bridge_cmd = (
-        "pkill -f vaani_bridge.py 2>/dev/null; sleep 0.3; "
+        "pkill -9 -f vaani_bridge.py 2>/dev/null; "
+        "for i in 1 2 3 4 5 6 7 8 9 10; do "
+        "  pgrep -f vaani_bridge.py >/dev/null || break; sleep 0.2; "
+        "done; "
         "nohup /home/pi/Documents/vaani_asterisk/run_vaani_bridge.sh "
         f"--mode outbound --endpoint PJSIP/{phone}@{sim_port} "
         f"--server \"ws://192.168.8.2:8000/ws/phone?voice_id={req.voice_id}\" "
@@ -1280,13 +1298,23 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
     call_history: list = []
     processing = False
     current_utterance_task: asyncio.Task | None = None
+    # TTS sub-tasks (synth + player) registered by process_utterance so _barge_in
+    # can hard-cancel them. Without this the player keeps draining queued audio
+    # for several seconds even after the user has interrupted.
+    current_tts_subtasks: list[asyncio.Task] = []
+    # Endpointing debounce: speech_end schedules processing 500ms in the future.
+    # If a new speech_start fires within that window, cancel and keep accumulating
+    # — this prevents chopping a sentence with brief mid-pauses into many turns.
+    pending_process_task: asyncio.Task | None = None
+    ENDPOINT_DEBOUNCE_S = 0.4  # [Refinement] Reduced from 0.5 for snappier response
+    MAX_BUFFER_BYTES = 32000 * 30  # 30s ceiling; older audio dropped if exceeded
     # Barge-in state: ai_speaking flips True inside tts_worker while audio is
     # actively streaming to the RPi. speech_end uses this to decide whether
     # to treat a user utterance as a normal turn or as a mid-response interrupt.
     ai_speaking = False
 
     async def _synthesize(text: str) -> bytes | None:
-        """High-speed streaming synthesis via decimation."""
+        """High-speed streaming synthesis. Returns 24kHz PCM bytes."""
         def _gen():
             audio_list = _models.tts_model.generate(
                 text=text,
@@ -1304,14 +1332,8 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                 audio_data = audio_data.cpu().numpy()
             audio_data = np.asarray(audio_data, dtype=np.float32)
             
-            # Direct 8kHz extraction (Decimation) - Zero CPU overhead
-            # 24kHz / 3 = 8kHz
-            audio_8k = audio_data[::3]
-            
-            # Fast Fixed Gain Boost & Clipping
-            pcm_8k = (np.clip(audio_8k * 1.4, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-            
-            return audioop.lin2ulaw(pcm_8k, 2)
+            # Return raw PCM 16-bit 24kHz (Standard for internal bridges)
+            return (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
 
         try:
             return await asyncio.to_thread(_gen)
@@ -1319,17 +1341,19 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
             print(f"[Phone] Synthesis error: {e}", flush=True)
             return None
 
-    async def _send_to_bridge(ulaw: bytes):
-        """Send ulaw audio to bridge in paced chunks."""
+    async def _send_to_bridge(audio: bytes):
+        """Send 16kHz LE PCM16 audio to bridge in paced chunks. Bridge converts to ulaw on wire."""
         chunk_size = 8000
-        for i in range(0, len(ulaw), chunk_size):
-            await websocket.send_bytes(ulaw[i : i + chunk_size])
-            # No sleep here; bridge handles pacing. Immediate delivery to bridge queue is better.
+        for i in range(0, len(audio), chunk_size):
+            await websocket.send_bytes(audio[i : i + chunk_size])
 
     async def say(text: str):
         """Legacy helper for greeting."""
         audio = await _synthesize(text)
-        if audio: await _send_to_bridge(audio)
+        if audio:
+            # 24kHz PCM -> 16kHz PCM (bridge handles 16k -> 8k ulaw on wire)
+            audio_16k, _ = audioop.ratecv(audio, 2, 1, 24000, 16000, None)
+            await _send_to_bridge(audio_16k)
 
     # Matches lone backchannels — 1-2 word affirmative fillers that should NOT
     # barge in on the AI. Covers Hindi + common English equivalents.
@@ -1349,9 +1373,43 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
             return True
         return False
 
+    def _preprocess_for_stt(pcm_16k: bytes) -> np.ndarray:
+        """Clean up phone audio before STT to lift accuracy on 8kHz-upsampled
+        telephony audio:
+          - DC offset removal (Asterisk ulaw->slin leaves a small bias)
+          - Trim leading/trailing low-energy frames (pre-roll noise dilutes STT)
+          - Peak-normalize to -3 dBFS so quiet calls don't get under-decoded
+        Returns float32 mono in [-1, 1] expected by both Sarvam and Whisper."""
+        audio = np.frombuffer(pcm_16k, dtype=np.int16).astype(np.float32) / 32768.0
+        if audio.size == 0:
+            return audio
+        # 1. DC offset removal
+        audio = audio - audio.mean()
+        # 2. Trim silence at edges using a simple energy gate (32ms windows).
+        win = 512  # 32 ms at 16 kHz
+        if audio.size > win * 2:
+            n_frames = audio.size // win
+            frames = audio[: n_frames * win].reshape(n_frames, win)
+            energy = np.abs(frames).mean(axis=1)
+            thresh = max(0.005, energy.max() * 0.05)
+            voiced = np.where(energy > thresh)[0]
+            if voiced.size > 0:
+                # Keep ~100ms of leading context so we don't clip the first phoneme.
+                start = max(0, voiced[0] - 3) * win
+                end = min(n_frames, voiced[-1] + 4) * win
+                audio = audio[start:end]
+        # 3. Peak-normalize to -3 dBFS (~0.707) — boosts quiet voices without clipping
+        peak = float(np.abs(audio).max())
+        if peak > 1e-4:
+            audio = audio * (0.707 / peak)
+            np.clip(audio, -1.0, 1.0, out=audio)
+        return audio
+
     async def _run_stt(pcm_16k: bytes) -> str:
         """Standalone STT — returns transcript or empty string on failure."""
-        audio_np = np.frombuffer(pcm_16k, dtype=np.int16).astype(np.float32) / 32768.0
+        audio_np = _preprocess_for_stt(pcm_16k)
+        if audio_np.size < 1600:  # <100ms after trim — nothing to transcribe
+            return ""
         stt_client = getattr(app.state, 'stt_client', None)
         try:
             if stt_client is not None and hasattr(stt_client, 'transcribe'):
@@ -1369,7 +1427,10 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
     async def _barge_in(reason: str):
         """User interrupted with substantive speech — silence AI immediately.
         1. Tell RPi to flush its RTP sender queue (line goes silent instantly).
-        2. Cancel the entire utterance pipeline (LLM stream + TTS worker).
+        2. Hard-cancel the synth and player sub-tasks (otherwise the player would
+           drain whatever's already in audio_ready_queue, playing several more
+           seconds of AI speech after the user interrupts).
+        3. Cancel the outer utterance task (LLM stream).
         Caller is responsible for starting the new user turn afterwards."""
         nonlocal processing, ai_speaking, current_utterance_task
         print(f"[Phone] BARGE-IN: {reason}", flush=True)
@@ -1378,8 +1439,11 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
             await websocket.send_json({"type": "barge_in"})
         except Exception as e:
             print(f"[Phone] barge_in signal send failed: {e}", flush=True)
-        # Cancelling the outer task propagates through all awaits (httpx stream
-        # and tts_task.put/get), unwinding cleanly.
+        # Kill TTS sub-tasks first so no more bytes go on the wire.
+        for st in list(current_tts_subtasks):
+            if not st.done():
+                st.cancel()
+        # Cancelling the outer task propagates through the LLM streaming loop.
         task = current_utterance_task
         if task is not None and not task.done():
             task.cancel()
@@ -1387,6 +1451,13 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        # Wait for sub-tasks to finish unwinding so ai_speaking flips back cleanly.
+        for st in list(current_tts_subtasks):
+            try:
+                await st
+            except (asyncio.CancelledError, Exception):
+                pass
+        current_tts_subtasks.clear()
         ai_speaking = False
         processing = False
         current_utterance_task = None
@@ -1471,7 +1542,9 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                             break
                         audio = await _synthesize(text)
                         if audio:
-                            await audio_ready_queue.put((text, audio))
+                            # 24kHz PCM -> 16kHz PCM. Bridge does 16k -> 8k ulaw on the wire.
+                            audio_16k, _ = audioop.ratecv(audio, 2, 1, 24000, 16000, None)
+                            await audio_ready_queue.put((text, audio_16k))
                 except Exception as e:
                     print(f"[Phone] Synthesizer worker failed: {e}", flush=True)
 
@@ -1486,12 +1559,15 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                         ai_speaking = True
                         tts_chunk_count[0] += 1
                         await broadcast_log("status", f"[Phone] Playing TTS chunk {tts_chunk_count[0]}: {text[:50]!r}")
+                        # Emit the exact text being spoken for karaoke-style word highlighting
+                        await broadcast_log("phone_tts_speaking", text)
                         
                         # Send audio and WAIT for it to play out on the phone.
                         # This ensures ai_speaking remains True during the actual speech,
                         # which is critical for the barge-in (interrupt) system to work.
                         await _send_to_bridge(audio)
-                        duration = len(audio) / 8000.0
+                        # 16kHz LE PCM16 = 32000 B/s; sleep so ai_speaking stays True for the whole playback.
+                        duration = len(audio) / 32000.0
                         await asyncio.sleep(duration)
                         
                         await broadcast_log("status", f"[Phone] Played chunk {tts_chunk_count[0]} ({int(duration*1000)}ms)")
@@ -1500,6 +1576,9 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
 
             synth_task = asyncio.create_task(tts_synthesizer_worker())
             play_task = asyncio.create_task(tts_player_worker())
+            # Register so _barge_in can hard-cancel them on user interrupt.
+            current_tts_subtasks.append(synth_task)
+            current_tts_subtasks.append(play_task)
             tts_task = asyncio.gather(synth_task, play_task)
 
             llm_t0 = time.time()
@@ -1509,7 +1588,7 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
 
             try:
                 messages = [
-                    *call_history[-8:],
+                    *call_history[-30:],
                     {"role": "user", "content": transcript},
                 ]
                 payload = provider.build_payload(system_prompt, messages)
@@ -1532,6 +1611,8 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                     async with client.stream("POST", provider.url,
                                              headers=provider.headers(),
                                              json=payload) as resp:
+                        import typing
+                        resp = typing.cast(httpx.Response, resp)
                         if resp.status_code != 200:
                             err_txt = await resp.aread()
                             print(f"[Phone] LLM Error {resp.status_code}: {err_txt.decode()}", flush=True)
@@ -1560,6 +1641,9 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                                         first_token = False
                                     
                                     full_response += clean_delta
+                                    # [LIVE STREAM] Push partial AI text to both voice clients AND log clients
+                                    await push_phone_transcript("ai", full_response, is_partial=True)
+                                    await broadcast_log("phone_ai_partial", full_response)
                                     sentence_buf += clean_delta
                                     
                                     # Use 'Split and Pop' logic but PRESERVE the punctuation.
@@ -1631,13 +1715,20 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
             call_history.append({"role": "assistant", "content": response_text})
             print(f"[Phone] AI ({total_ms}ms total): {response_text[:80]}", flush=True)
             await broadcast_log("phone_ai", response_text)
-            await push_phone_transcript("ai", response_text)
+            # Final transcript push (is_partial=False)
+            await push_phone_transcript("ai", response_text, is_partial=False)
             await broadcast_log("status", f"[Phone] Turn done — total {total_ms}ms, {tts_chunk_count[0]} TTS chunks")
 
         except Exception as e:
             await broadcast_log("system", f"[Phone] Pipeline error: {e}")
             print(f"[Phone] Pipeline error: {e}", flush=True)
         finally:
+            # Deregister TTS subtasks so a stale reference doesn't outlive this
+            # turn. Sub-tasks may not be defined if we failed before creating them.
+            for name in ("synth_task", "play_task"):
+                st = locals().get(name)
+                if st is not None and st in current_tts_subtasks:
+                    current_tts_subtasks.remove(st)
             ai_speaking = False
             processing = False
 
@@ -1652,11 +1743,12 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                 break
 
             if "bytes" in message:
-                ulaw = message["bytes"]
-                pcm_8k = audioop.ulaw2lin(ulaw, 2)
-                pcm_16k, stt_resample_state = audioop.ratecv(
-                    pcm_8k, 2, 1, 8000, 16000, stt_resample_state)
-                stt_buffer.extend(pcm_16k)
+                # Bridge sends 16kHz LE PCM16 directly (RPi-side ulaw->16k conversion).
+                stt_buffer.extend(message["bytes"])
+                if len(stt_buffer) > MAX_BUFFER_BYTES:
+                    # Drop oldest samples; keep last MAX_BUFFER_BYTES so a stuck
+                    # debounce never grows the buffer without bound.
+                    del stt_buffer[: len(stt_buffer) - MAX_BUFFER_BYTES]
 
             elif "text" in message:
                 ev = json.loads(message["text"])
@@ -1676,39 +1768,106 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                     ))
 
                 elif t == "speech_start":
+                    # Cancel any pending debounced processor — the user is continuing
+                    # to speak after a brief pause, so we should accumulate not process.
+                    if pending_process_task is not None and not pending_process_task.done():
+                        pending_process_task.cancel()
+                        pending_process_task = None
+                    # NOTE: do NOT clear stt_buffer here. Continuations within the
+                    # debounce window must concatenate so STT sees a complete sentence.
                     stt_resample_state = None
-                    stt_buffer.clear()
 
                 elif t == "speech_end":
                     buf_bytes = len(stt_buffer)
                     buf_secs = round(buf_bytes / 32000, 1)  # 16kHz PCM16 = 32000 B/s
                     print(f"[Phone] speech_end — buffer={buf_bytes}B ({buf_secs}s)", flush=True)
                     await broadcast_log("status", f"[Phone] speech_end buffer={buf_secs}s")
-                    if buf_bytes > 3200:
-                        # Sarvam STT limit is 30s; take last 29s if buffer is too long
-                        MAX_STT_BYTES = 928000  # 29s at 16kHz PCM16
-                        if buf_bytes > MAX_STT_BYTES:
-                            print(f"[Phone] Buffer too large ({buf_secs}s), trimming to 29s", flush=True)
-                            await broadcast_log("system", f"[Phone] WARNING: trimming {buf_secs}s audio to 29s for STT")
-                            chunk = bytes(stt_buffer[-MAX_STT_BYTES:])
-                        else:
-                            chunk = bytes(stt_buffer)
+                    if buf_bytes <= 3200:
+                        # Tiny fragment, drop and wait for real speech
                         stt_buffer.clear()
-                        stt_resample_state = None
-                        if ai_speaking:
-                            # Mid-response: run STT first to decide barge-in vs ignore.
-                            # Backchannels ("हम्म", "जी") let AI continue; substantive
-                            # speech cancels the pipeline and starts a new turn.
-                            current_utterance_task = asyncio.create_task(
-                                _handle_mid_speech_interrupt(chunk))
-                        else:
-                            current_utterance_task = asyncio.create_task(
-                                process_utterance(chunk))
                     else:
-                        stt_buffer.clear()
+                        # Cancel any earlier pending processor — this newer speech_end
+                        # supersedes it (longer accumulated buffer).
+                        if pending_process_task is not None and not pending_process_task.done():
+                            pending_process_task.cancel()
+
+                        # Snapshot for speculative STT (run in parallel with debounce).
+                        # If no new audio arrives during the wait, this result is valid
+                        # and saves the STT round-trip after the debounce fires.
+                        snap = bytes(stt_buffer)
+
+                        async def _process_after_debounce(snap_at_fire: bytes):
+                            nonlocal current_utterance_task, stt_resample_state
+                            stt_client = getattr(app.state, 'stt_client', None)
+                            spec_task: asyncio.Task | None = None
+                            if stt_client is not None and hasattr(stt_client, 'transcribe'):
+                                spec_audio = _preprocess_for_stt(snap_at_fire)
+                                if spec_audio.size >= 1600:
+                                    spec_task = asyncio.create_task(stt_client.transcribe(spec_audio))
+
+                            try:
+                                await asyncio.sleep(ENDPOINT_DEBOUNCE_S)
+                            except asyncio.CancelledError:
+                                if spec_task and not spec_task.done():
+                                    spec_task.cancel()
+                                return
+
+                            chunk_bytes = len(stt_buffer)
+                            if chunk_bytes <= 3200:
+                                stt_buffer.clear()
+                                if spec_task and not spec_task.done():
+                                    spec_task.cancel()
+                                return
+                            MAX_STT_BYTES = 928000  # 29s at 16kHz PCM16 (Sarvam cap)
+                            if chunk_bytes > MAX_STT_BYTES:
+                                secs = round(chunk_bytes / 32000, 1)
+                                print(f"[Phone] Buffer too large ({secs}s), trimming to 29s", flush=True)
+                                await broadcast_log("system", f"[Phone] WARNING: trimming {secs}s audio to 29s for STT")
+                                chunk = bytes(stt_buffer[-MAX_STT_BYTES:])
+                            else:
+                                chunk = bytes(stt_buffer)
+                            stt_buffer.clear()
+                            stt_resample_state = None
+
+                            transcript: Optional[str] = None
+                            if spec_task is not None and chunk == snap_at_fire:
+                                # No new audio came during the debounce — speculative
+                                # transcription is a valid hit; saves an STT round trip.
+                                try:
+                                    # Ensure result is typed as str for the checker
+                                    transcript = str(await spec_task)
+                                    if transcript:
+                                        print(f"[Phone] Speculative STT hit", flush=True)
+                                except Exception:
+                                    transcript = None
+                            elif spec_task is not None:
+                                # Audio grew during debounce; drop the stale speculative.
+                                spec_task.cancel()
+
+                            if ai_speaking:
+                                if transcript is not None:
+                                    # Already have transcript — classify here to avoid double STT.
+                                    if _is_backchannel_or_noise(transcript):
+                                        await broadcast_log("status",
+                                            f"[Phone] Mid-speech ignored (backchannel/noise): {transcript!r}")
+                                        return
+                                    await _barge_in(f"user said {transcript!r}")
+                                    current_utterance_task = asyncio.create_task(
+                                        process_utterance(chunk, precomputed_transcript=transcript))
+                                else:
+                                    current_utterance_task = asyncio.create_task(
+                                        _handle_mid_speech_interrupt(chunk))
+                            else:
+                                current_utterance_task = asyncio.create_task(
+                                    process_utterance(chunk, precomputed_transcript=transcript))
+
+                        pending_process_task = asyncio.create_task(_process_after_debounce(snap))
 
                 elif t in ("call_end", "hangup"):
                     print(f"[Phone] Call ended ({t})", flush=True)
+                    # Cancel any pending debounced processor — call is over
+                    if pending_process_task is not None and not pending_process_task.done():
+                        pending_process_task.cancel()
                     # Wait for any in-flight STT→LLM→TTS task so response reaches phone
                     if current_utterance_task and not current_utterance_task.done():
                         try:

@@ -38,6 +38,8 @@ scratch_*.py
 /scratch/
 web_backend/scratch/
 web_backend/__pycache__/
+debug_captures/
+*.pcm
 
 # User-uploaded voice library (personal data; ravi_sir.mp3 stays tracked)
 assets/voices/*.mp3.mpeg

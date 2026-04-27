@@ -64,9 +64,80 @@ export default function VocalisDashboard() {
   const { state, messages, isLive, isMicMuted, toggleLive, toggleMic, switchVoice, switchModel, resetChat, sendText } =
     useVoice(activeVoiceId);
   const [chatInput, setChatInput] = useState("");
-  const [phoneMessages, setPhoneMessages] = useState<{role:"user"|"ai"; text:string}[]>([]);
+  // Phone transcript: real-time streaming with karaoke support
+  const [phoneMessages, setPhoneMessages] = useState<{role:"user"|"ai"; text:string; partial?:boolean; spokenIndex?:number}[]>([]);
+  // Track which word in the AI message is currently being spoken (karaoke)
+  const ttsTimerRef = useRef<NodeJS.Timeout | null>(null);
+
   const handlePhoneMessage = useCallback((msg: {role:"user"|"ai"; text:string}) => {
-    setPhoneMessages(prev => [...prev, msg]);
+    // Final messages: mark the last partial AI as complete, or add new user/ai
+    if (msg.role === "ai") {
+      setPhoneMessages(prev => {
+        // Find the last partial AI message and finalize it
+        const lastIdx = prev.findLastIndex(m => m.role === "ai" && m.partial);
+        if (lastIdx >= 0) {
+          const updated = [...prev];
+          updated[lastIdx] = { role: "ai", text: msg.text, partial: false };
+          return updated;
+        }
+        return [...prev, { role: "ai", text: msg.text }];
+      });
+    } else {
+      setPhoneMessages(prev => [...prev, { role: "user", text: msg.text }]);
+    }
+  }, []);
+
+  // Real-time partial AI text streaming (updates as LLM generates)
+  const handlePhoneAiPartial = useCallback((text: string) => {
+    setPhoneMessages(prev => {
+      const lastIdx = prev.findLastIndex(m => m.role === "ai" && m.partial);
+      if (lastIdx >= 0) {
+        const updated = [...prev];
+        updated[lastIdx] = { ...updated[lastIdx], text };
+        return updated;
+      }
+      return [...prev, { role: "ai", text, partial: true, spokenIndex: -1 }];
+    });
+  }, []);
+
+  // Karaoke: when TTS starts speaking a chunk, progressively highlight words
+  const handlePhoneTtsSpeaking = useCallback((chunk: string) => {
+    const words = chunk.split(/\s+/).filter(Boolean);
+    if (words.length === 0) return;
+    // Estimate ~200ms per word for Hindi speech
+    const msPerWord = 200;
+    let wordIdx = 0;
+    // Clear any previous karaoke timer
+    if (ttsTimerRef.current) clearInterval(ttsTimerRef.current);
+    // Find the chunk's position in the full response text
+    setPhoneMessages(prev => {
+      const lastAiIdx = prev.findLastIndex(m => m.role === "ai");
+      if (lastAiIdx < 0) return prev;
+      const fullText = prev[lastAiIdx].text;
+      const chunkStart = fullText.indexOf(chunk.trim());
+      if (chunkStart < 0) return prev;
+      // Count words before the chunk to get the starting word index
+      const textBeforeChunk = fullText.slice(0, chunkStart);
+      const wordsBeforeCount = textBeforeChunk.split(/\s+/).filter(Boolean).length;
+      const updated = [...prev];
+      updated[lastAiIdx] = { ...updated[lastAiIdx], spokenIndex: wordsBeforeCount };
+      // Start progressive highlighting
+      ttsTimerRef.current = setInterval(() => {
+        wordIdx++;
+        if (wordIdx >= words.length) {
+          if (ttsTimerRef.current) clearInterval(ttsTimerRef.current);
+          return;
+        }
+        setPhoneMessages(p => {
+          const idx = p.findLastIndex(m => m.role === "ai");
+          if (idx < 0) return p;
+          const u = [...p];
+          u[idx] = { ...u[idx], spokenIndex: wordsBeforeCount + wordIdx };
+          return u;
+        });
+      }, msPerWord);
+      return updated;
+    });
   }, []);
 
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
@@ -362,16 +433,47 @@ export default function VocalisDashboard() {
                   </motion.div>
                 ) : (
                   <div className="flex flex-col gap-2">
-                    {displayedMessages.map((msg, i) => (
+                    {displayedMessages.map((msg, i) => {
+                      const isPhoneAi = msg.role === "ai" && 'spokenIndex' in msg && typeof (msg as Record<string, unknown>).spokenIndex === "number";
+                      const spokenIdx = isPhoneAi ? ((msg as Record<string, unknown>).spokenIndex as number) : -1;
+                      const isPartial = 'partial' in msg && (msg as Record<string, unknown>).partial;
+                      const words = msg.text.split(/\s+/).filter(Boolean);
+                      return (
                       <motion.div key={`${viewingSessionId ?? "live"}-${i}`} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.15 }} className={`flex flex-col gap-0.5 ${msg.role === "user" ? "items-end" : "items-start"}`}>
                         <span className={`text-[8px] font-bold uppercase tracking-[0.2em] px-1 ${msg.role === "user" ? "text-emerald-500/50" : "text-slate-600"}`}>
                           {msg.role === "user" ? "You" : activeVoiceName}
+                          {isPartial && <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse ml-1.5 align-middle" />}
                         </span>
                         <div className={`max-w-[90%] px-3 py-2 rounded-2xl text-[11px] leading-relaxed ${msg.role === "user" ? "bg-emerald-500/10 border border-emerald-500/20 text-emerald-100 rounded-tr-sm" : "bg-white/5 border border-white/10 text-slate-200 rounded-tl-sm"}`}>
-                          {msg.text}
+                          {isPhoneAi && spokenIdx >= 0 ? (
+                            <span>
+                              {words.map((word, wi) => {
+                                const isSpoken = wi <= spokenIdx;
+                                const isCurrent = wi === spokenIdx;
+                                return (
+                                  <span
+                                    key={wi}
+                                    className={`transition-all duration-200 ${
+                                      isCurrent
+                                        ? "text-amber-300 font-semibold"
+                                        : isSpoken
+                                        ? "text-slate-100"
+                                        : "text-slate-500"
+                                    }`}
+                                    style={isCurrent ? { textShadow: "0 0 8px rgba(251,191,36,0.5)" } : undefined}
+                                  >
+                                    {word}{wi < words.length - 1 ? " " : ""}
+                                  </span>
+                                );
+                              })}
+                            </span>
+                          ) : (
+                            msg.text
+                          )}
                         </div>
                       </motion.div>
-                    ))}
+                      );
+                    })}
                     <div ref={chatEndRef} />
                   </div>
                 )}
@@ -420,7 +522,7 @@ export default function VocalisDashboard() {
 
             {/* Row 2: Telemetry / Logs */}
             <div className="flex-[0.45] rounded-3xl bg-[#0c0c0e] border border-white/[0.05] overflow-hidden shadow-2xl flex flex-col">
-               <TelemetryBento onPhoneMessage={handlePhoneMessage} />
+               <TelemetryBento onPhoneMessage={handlePhoneMessage} onPhoneAiPartial={handlePhoneAiPartial} onPhoneTtsSpeaking={handlePhoneTtsSpeaking} />
             </div>
 
           </div>

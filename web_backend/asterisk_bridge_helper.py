@@ -115,8 +115,8 @@ class AsteriskCallSession:
     async def _run_heartbeat(self):
         """Send silent RTP frames to keep connection alive during thinking/pauses."""
         print(f"[Call {self.channel_id}] Heartbeat (Comfort Noise) task started.", flush=True)
-        # 20ms of 16-bit PCM silence (matches voice ptime for 8k slin)
-        silence_frame = b'\x00' * 320
+        # 20ms of 16-bit PCM silence (matches voice ptime for 16k slin16)
+        silence_frame = b'\x00' * 640
         while self.is_active:
             try:
                 # Only send if AI hasn't spoken in the last 100ms
@@ -164,7 +164,7 @@ class AsteriskCallSession:
             external_media_data = {
                 "app": "ai-call-app",
                 "external_host": f"{self.bridge_app.local_ip}:{self.udp_port}",
-                "format": "slin"
+                "format": "slin16" # [HD] Standard for 16kHz audio
             }
 
             async with httpx.AsyncClient(auth=ARI_AUTH, timeout=10.0) as client:
@@ -220,7 +220,7 @@ class AsteriskCallSession:
                 llm_extras=provider.payload_extras() if provider else None,
                 get_provider=_cur_provider,
                 get_campaign=_cur_campaign,
-                input_sampling_rate=8000,  # Correct for Telephony
+                input_sampling_rate=16000,  # [HD] Correct for 16kHz Telephony
             )
             self.assistant.reset_session() # Reset session clock and state
             print(f"[Call {self.channel_id}] AI assistant ready.", flush=True)
@@ -302,13 +302,14 @@ class AsteriskCallSession:
             pcm_be = np.frombuffer(raw_payload, dtype='>i2').astype(np.float32) / 32768.0
             rms_be = np.sqrt(np.mean(pcm_be**2))
             
-            # The one with REALLY high RMS is usually the one with 'byte-swapped' noise
-            if rms_be > 0.7 and rms_le < 0.4:
-                pcm_data = pcm_le # Gateway is sending Little Endian
-            elif rms_le > 0.7 and rms_be < 0.4:
-                pcm_data = pcm_be # Gateway is sending Big Endian (Standard)
+            # Correct interpretation has markedly LOWER RMS than the byte-swapped one.
+            # Use a ratio so detection works at normal speech levels, not just extremes.
+            if rms_le <= rms_be * 0.66:
+                pcm_data = pcm_le  # native LE (Asterisk slin default on RPi/x86)
+            elif rms_be <= rms_le * 0.66:
+                pcm_data = pcm_be  # gateway sending standard BE L16
             else:
-                pcm_data = pcm_be # Fallback to standard
+                pcm_data = pcm_le  # ambiguous (silence) — safe LE default
                 
         except Exception as e:
             print(f"[Call {self.channel_id}] Decoder Error: {e}")
@@ -346,8 +347,6 @@ class AsteriskCallSession:
         self.rtp_ts += len(pcm_payload) // 2
         return header + pcm_payload
 
-    async def on_ai_event(self, msg_type, data):
-        """Handle events from WebAssistant."""
     async def _run_rtp_playback(self):
         """Dedicated task to drain ai_audio_queue and send RTP frames with precise pacing."""
         print(f"[Call {self.channel_id}] Playback task started.", flush=True)
@@ -355,32 +354,34 @@ class AsteriskCallSession:
             try:
                 data = await self.ai_audio_queue.get()
                 
-                # Offload heavy audio processing (decimation, conversion) to a thread
+                # Offload heavy audio processing (resampling, conversion) to a thread
                 def process_audio(raw_data):
                     # 1. From 24kHz Native to Float
                     audio_24k = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
                     
-                    # 2. Proper polyphase downsample 24k -> 8k.
+                    # 2. Proper polyphase downsample 24k -> 16k (HD).
+                    # Ratio 2/3: 24000 * (2/3) = 16000
                     if len(audio_24k) >= 3:
-                        audio_8k = signal.resample_poly(audio_24k, 1, 3).astype(np.float32)
+                        audio_16k = signal.resample_poly(audio_24k, 2, 3).astype(np.float32)
                     else:
-                        audio_8k = audio_24k[::3]
+                        # Fallback simple decimation if too short
+                        audio_16k = audio_24k[::1.5] # Approximate
                     
                     # 3. Convert 16-bit PCM Linear to Big-Endian (Standard L16)
-                    # Apply 2.0x POWER GAIN for telephony clarity
-                    return (np.clip(audio_8k * 2.5, -1, 1) * 32767).astype('>i2').tobytes()
+                    # Apply 1.5x gain for telephony clarity
+                    return (np.clip(audio_16k * 1.5, -1.0, 1.0) * 32767).astype('>i2').tobytes()
 
-                pcm_8k = await asyncio.to_thread(process_audio, data)
+                pcm_16k = await asyncio.to_thread(process_audio, data)
 
                 if self.transport and self.peer_addr:
-                    # [Phase 20] Send as 20ms RTP frames
-                    FRAME_BYTES = 320 
+                    # [HD] 16kHz 20ms RTP frame is 640 bytes (320 samples * 2 bytes)
+                    FRAME_BYTES = 640 
                     frames_sent = 0
                     session_start_time = time.perf_counter()
                     
-                    for i in range(0, len(pcm_8k), FRAME_BYTES):
+                    for i in range(0, len(pcm_16k), FRAME_BYTES):
                         if not self.is_active: break
-                        frame = pcm_8k[i:i + FRAME_BYTES]
+                        frame = pcm_16k[i:i + FRAME_BYTES]
                         if len(frame) < FRAME_BYTES:
                             frame += b'\x00' * (FRAME_BYTES - len(frame))
                         

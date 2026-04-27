@@ -28,7 +28,7 @@ import numpy as np
 
 
 SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
-SARVAM_DEFAULT_MODEL = "saarika:v2.5"
+SARVAM_DEFAULT_MODEL = "saaras:v3"
 SARVAM_DEFAULT_LANGUAGE = "hi-IN"
 
 WHISPER_DEFAULT_MODEL = "large-v3-turbo"
