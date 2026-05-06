@@ -1,4 +1,4 @@
 {
-  "provider": "ollama",
-  "model": "gemma3:4b"
+  "provider": "llamacpp",
+  "model": "gemma-4-26b-it-Q4_K_M"
 }

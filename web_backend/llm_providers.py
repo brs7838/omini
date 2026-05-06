@@ -222,7 +222,29 @@ class LLMProvider:
         effective_system += "NEVER output bracketed acoustic tags like [laughter], [sigh], [sniff] or any '[...]' marker — they are read literally on this voice line, not as sound effects. Express emotion through word choice and exclamations instead. "
         effective_system += "Always finish your sentence with proper punctuation — never stop mid-word."
 
-        full_messages = [{"role": "system", "content": effective_system}] + messages
+        if self.name == "llamacpp" and messages:
+            # Many llama.cpp templates (like Gemma) are strict about alternating
+            # user/assistant roles and don't have a dedicated 'system' role.
+            # Prepending 'system' often maps it to 'user', causing a 
+            # 'roles must alternate' error. Merge it into the first user msg instead.
+            full_messages = []
+            system_injected = False
+            for m in messages:
+                if not system_injected and m["role"] == "user":
+                    full_messages.append({
+                        "role": "user",
+                        "content": f"{effective_system}\n\nUSER: {m['content']}"
+                    })
+                    system_injected = True
+                else:
+                    full_messages.append(m)
+            
+            # Fallback if no user message found (unlikely)
+            if not system_injected:
+                full_messages = [{"role": "system", "content": effective_system}] + messages
+        else:
+            full_messages = [{"role": "system", "content": effective_system}] + messages
+
         return {
             "model": effective_model,
             "messages": full_messages,

@@ -59,6 +59,7 @@ export default function ModelSettings({ isOpen, onClose, onSelect, activeModelId
     if (provider === "llamacpp") {
       return [
         { id: "default",                           name: "Currently Loaded Model" },
+        { id: "gemma-4-26b-it-Q4_K_M",             name: "Gemma 4 (26B) Q4_K_M" },
         { id: "gemma-3-4b-it-Q4_K_M",              name: "Gemma 3 (4B) Q4_K_M" },
         { id: "gemma-3-12b-it-Q4_K_M",             name: "Gemma 3 (12B) Q4_K_M" },
         { id: "Phi-4-mini-instruct-Q4_K_M",        name: "Phi 4 Mini Q4_K_M" },
@@ -197,7 +198,7 @@ export default function ModelSettings({ isOpen, onClose, onSelect, activeModelId
                   </span>
                 )}
               </div>
-              <div className="grid grid-cols-4 gap-2 p-1 rounded-2xl bg-white/[0.03] border border-white/5">
+              <div className="grid grid-cols-2 gap-2 p-1 rounded-2xl bg-white/[0.03] border border-white/5">
                 <ProviderPill
                   active={viewedProvider === "ollama"}
                   isBackendActive={providerState?.provider === "ollama"}
@@ -325,7 +326,7 @@ function ProviderPill({
     <button
       disabled={loading}
       onClick={onClick}
-      className={`relative flex items-center gap-2.5 px-3 py-2.5 rounded-xl border transition-all ${
+      className={`relative flex items-center gap-2 px-2 py-2 rounded-xl border transition-all ${
         active
           ? activeCls
           : "bg-transparent border-transparent text-slate-400 hover:bg-white/5 hover:text-white"

@@ -636,6 +636,7 @@ async def get_llm_models():
     if provider.name == "llamacpp":
         return [
             {"id": "default",                  "name": "Currently Loaded Model"},
+            {"id": "gemma-4-26b-it-Q4_K_M",    "name": "Gemma 4 (26B) Q4_K_M"},
             {"id": "gemma-3-4b-it-Q4_K_M",     "name": "Gemma 3 (4B) Q4_K_M"},
             {"id": "gemma-3-12b-it-Q4_K_M",    "name": "Gemma 3 (12B) Q4_K_M"},
             {"id": "Phi-4-mini-instruct-Q4_K_M", "name": "Phi 4 Mini Q4_K_M"},

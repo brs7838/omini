@@ -21,7 +21,7 @@ os.environ["NPY_DISABLE_CPU_FEATURES"] = "AVX512F"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID" # Ensure index matches hardware
 os.environ["OLLAMA_MAX_LOADED_MODELS"] = "1"   # Keep one model in memory for faster turn-around
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["HF_HUB_OFFLINE"] = "1"           # Force local model loading (Bypass DNS errors)
+os.environ["HF_HUB_OFFLINE"] = "0"           # Allow downloading missing models (like OmniVoice) if not in cache
 # -------------------------------------------------------------
 
 def kill_port(port):
