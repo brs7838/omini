@@ -5,8 +5,9 @@ import numpy as np
 import sys
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 
+import io
 if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 def worker(device, results):
     """Worker to load model and generate audio on a specific GPU."""

@@ -78,7 +78,7 @@ export default function SttChip() {
     return (
       <button
         disabled
-        className="flex items-center gap-2 pl-3 pr-4 h-11 rounded-full bg-white/5 border border-white/10 text-slate-600 opacity-60 cursor-wait"
+        className="flex items-center gap-2 pl-3 pr-4 h-11 rounded-xl bg-white/5 border border-white/10 text-slate-600 opacity-60 cursor-wait"
         title="STT status…"
       >
         <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -101,7 +101,7 @@ export default function SttChip() {
         onClick={() => setOpen(o => !o)}
         disabled={busy}
         title={`STT: ${label}${isWhisper ? " (on GPU)" : " (cloud)"}`}
-        className={`flex items-center gap-2 pl-3 pr-3 h-11 rounded-full border transition-all ${
+        className={`flex items-center gap-2 pl-3 pr-3 h-11 rounded-xl border transition-all ${
           open
             ? "bg-white/10 border-white/20 text-white"
             : "bg-white/5 border-white/10 text-slate-400 hover:bg-white/10 hover:text-white"

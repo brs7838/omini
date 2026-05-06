@@ -432,14 +432,15 @@ export default function VocalisDashboard() {
                     <p className="text-[9px] font-bold text-center uppercase tracking-widest text-zinc-600">Conversation Empty</p>
                   </motion.div>
                 ) : (
-                  <div className="flex flex-col gap-2">
-                    {displayedMessages.map((msg, i) => {
+                  <div className="flex flex-col-reverse gap-2">
+                    <div ref={chatEndRef} />
+                    {[...displayedMessages].reverse().map((msg, i) => {
                       const isPhoneAi = msg.role === "ai" && 'spokenIndex' in msg && typeof (msg as Record<string, unknown>).spokenIndex === "number";
                       const spokenIdx = isPhoneAi ? ((msg as Record<string, unknown>).spokenIndex as number) : -1;
-                      const isPartial = 'partial' in msg && (msg as Record<string, unknown>).partial;
+                      const isPartial = 'partial' in msg && !!(msg as Record<string, unknown>).partial;
                       const words = msg.text.split(/\s+/).filter(Boolean);
                       return (
-                      <motion.div key={`${viewingSessionId ?? "live"}-${i}`} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.15 }} className={`flex flex-col gap-0.5 ${msg.role === "user" ? "items-end" : "items-start"}`}>
+                      <motion.div key={`${viewingSessionId ?? "live"}-${displayedMessages.length - 1 - i}`} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.15 }} className={`flex flex-col gap-0.5 ${msg.role === "user" ? "items-end" : "items-start"}`}>
                         <span className={`text-[8px] font-bold uppercase tracking-[0.2em] px-1 ${msg.role === "user" ? "text-emerald-500/50" : "text-slate-600"}`}>
                           {msg.role === "user" ? "You" : activeVoiceName}
                           {isPartial && <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse ml-1.5 align-middle" />}
@@ -474,7 +475,6 @@ export default function VocalisDashboard() {
                       </motion.div>
                       );
                     })}
-                    <div ref={chatEndRef} />
                   </div>
                 )}
               </AnimatePresence>

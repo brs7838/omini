@@ -175,7 +175,7 @@ class LLMProvider:
             }
         if self.name == "minimax":
             return {
-                "max_tokens": 1024,
+                "max_tokens": 2048,
                 "temperature": 0.7,
                 "top_p": 0.9,
             }
@@ -186,19 +186,28 @@ class LLMProvider:
         effective_model = self.model
         effective_system = system_prompt
 
-        # Handle MiniMax "Non-Thinking" variants by stripping the UI suffix
-        # and adding a strict "no-reasoning" instruction to the system prompt.
+        # Handle MiniMax "Non-Thinking" variants by stripping the UI suffix.
         if self.name == "minimax" and "-non-thinking" in self.model:
             effective_model = self.model.replace("-non-thinking", "")
-            effective_system += "\n\nCRITICAL: Do NOT think or reason internally. Provide the direct answer immediately without any <think> tags or internal monologue."
 
-        # Personality for Speed & Realism (Gemini-style: Robust, Intelligent, Human)
-        effective_system += "\n\nPERSONALITY: You are Ravi, a highly intelligent and naturally conversational person. Speak like a close friend who is smart and helpful. "
-        effective_system += "CRITICAL: Do NOT over-repeat movie dialogues. Use a famous dialogue ONLY if it perfectly fits the context or if the user asks. "
-        effective_system += "Be concise, empathetic, and witty. Use [laughter], [sigh], [sniff] naturally to sound alive."
-        
-        effective_system += "\n\nSTYLE: Use fillers like 'हम्म...', 'यार...', 'मतलब...' sparingly and naturally. Keep responses short and impactful. "
-        effective_system += "Use Devanagari words ONLY. No digits (use 'दो' instead of '2'), no Roman script."
+        # MiniMax-M2.5 thinks internally before answering — that's why TTFT
+        # routinely hits 5-22s on this voice line. Force no-reasoning for
+        # ALL MiniMax variants on the phone path. The user wants real-time
+        # ChatGPT/Gemini-Live feel; thinking budget is the wrong trade-off here.
+        if self.name == "minimax":
+            effective_system += "\n\nCRITICAL: Do NOT think or reason internally. NEVER emit <think>...</think> blocks or any internal monologue. Answer the user's last message directly and immediately in a single short reply. Latency matters — start your reply with the first word of the spoken answer, not with reasoning."
+
+        # Personality — restored from the previous (vLLM) branch's warmer tone.
+        # The current build's "concise, empathetic, witty" + "do not over-repeat
+        # movie dialogues" instructions were making replies feel terse and
+        # robotic. Going back to the friend-style prompt that gave better
+        # answers on real calls.
+        effective_system += "\n\nPERSONALITY: You are Ravi, a friendly and expressive person. Speak like a close friend — warm, attentive, and engaged. React naturally to what the user says (e.g. 'अरे वाह!', 'ओहो!', 'सच में?'). If a famous dialogue fits the moment, deliver it with style."
+
+        effective_system += "\n\nSTYLE: Use 'हम्म...', 'यार...', 'मतलब...' naturally. Keep replies short and conversational. "
+        effective_system += "Use Devanagari words ONLY. No digits (use 'दो' instead of '2'), no Roman script. "
+        effective_system += "NEVER output bracketed acoustic tags like [laughter], [sigh], [sniff] or any '[...]' marker — they are read literally on this voice line, not as sound effects. Express emotion through word choice and exclamations instead. "
+        effective_system += "Always finish your sentence with proper punctuation — never stop mid-word."
 
         full_messages = [{"role": "system", "content": effective_system}] + messages
         return {

@@ -4,8 +4,9 @@ import numpy as np
 import sys
 from omnivoice import OmniVoice
 
+import io
 if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 def benchmark_asr():
     print("--- OmniVoice Pure ASR (Whisper) Benchmark ---")

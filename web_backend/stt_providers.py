@@ -163,6 +163,12 @@ class SarvamSTT:
             print(f"[SarvamSTT] JSON parse error: {e}", flush=True)
             return ""
         transcript = (body.get("transcript") or "").strip()
+        if not transcript:
+            # Help diagnose silent failures (audio judged as noise, mismatched
+            # language_code, request_id pinned for support follow-up, etc.).
+            keys = list(body.keys()) if isinstance(body, dict) else []
+            req_id = body.get("request_id") if isinstance(body, dict) else None
+            print(f"[SarvamSTT] empty transcript keys={keys} request_id={req_id}", flush=True)
         return transcript
 
     async def aclose(self):

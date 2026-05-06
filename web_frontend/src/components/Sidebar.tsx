@@ -1,6 +1,6 @@
 "use client";
 
-import { History, Plus, Menu, Settings, Zap, Trash2, MessageSquare, Layers } from "lucide-react";
+import { History, Plus, Menu, Zap, Trash2, MessageSquare, Layers, Settings2 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useMemo } from "react";
 
@@ -16,8 +16,8 @@ interface SidebarProps {
   isCollapsed: boolean;
   onToggle: () => void;
   onNewChat: () => void;
-  onSettingsClick: () => void;
   onCampaignClick: () => void;
+  onSettingsClick: () => void;
   sessions: ChatSession[];
   activeSessionId: string | null;
   onSelectSession: (id: string) => void;
@@ -51,8 +51,8 @@ export default function Sidebar({
   isCollapsed,
   onToggle,
   onNewChat,
-  onSettingsClick,
   onCampaignClick,
+  onSettingsClick,
   sessions,
   activeSessionId,
   onSelectSession,
@@ -64,7 +64,7 @@ export default function Sidebar({
     <motion.aside
       initial={false}
       animate={{ width: isCollapsed ? 80 : 300 }}
-      className="fixed left-0 top-0 h-full bg-slate-950/60 backdrop-blur-3xl border-r border-white/5 z-50 flex flex-col shadow-2xl"
+      className="fixed left-0 top-0 h-full bg-[#08080a] border-r border-white/5 z-[9999] flex flex-col shadow-2xl"
     >
       {/* Header */}
       <div className="p-4 flex flex-col items-center">
@@ -169,23 +169,37 @@ export default function Sidebar({
       </div>
 
       {/* Footer */}
-      <div className="p-4 mt-auto border-t border-white/5 flex flex-col gap-2 pb-4">
+      <div className="mt-auto border-t border-white/5 bg-[#08080a] p-4 flex flex-col gap-4 pb-6 z-30">
+        {/* Templates Button - Top */}
         <button
           onClick={onCampaignClick}
-          className={`w-full flex items-center gap-4 p-2.5 rounded-xl hover:bg-white/5 transition-colors group ${isCollapsed ? "justify-center" : ""}`}
+          className={`w-full flex items-center gap-4 p-3 rounded-xl hover:bg-white/5 transition-colors group ${isCollapsed ? "justify-center" : ""}`}
         >
           <Layers className="w-4 h-4 text-slate-500 group-hover:text-slate-300 shrink-0" />
           {!isCollapsed && <span className="text-sm text-slate-400 font-medium">Templates & Behavior</span>}
         </button>
 
+        {/* Settings Button */}
         <button
           onClick={onSettingsClick}
-          className={`w-full flex items-center gap-4 p-2.5 rounded-xl hover:bg-white/5 transition-colors group ${isCollapsed ? "justify-center" : ""}`}
+          className={`w-full flex items-center gap-4 p-3 rounded-xl hover:bg-white/5 transition-colors group ${isCollapsed ? "justify-center" : ""}`}
         >
-          <Settings className="w-4 h-4 text-slate-500 group-hover:text-slate-300 shrink-0" />
+          <Settings2 className="w-4 h-4 text-slate-500 group-hover:text-slate-300 shrink-0" />
           {!isCollapsed && <span className="text-sm text-slate-400 font-medium">Model Settings</span>}
         </button>
 
+        {/* Profile Section - Emerald Theme */}
+        <div className={`flex items-center mt-2 ${isCollapsed ? "justify-center" : "gap-3 px-1"}`}>
+          <div className="w-9 h-9 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0">
+            <span className="text-emerald-400 font-bold text-sm">N</span>
+          </div>
+          {!isCollapsed && (
+            <div className="flex flex-col min-w-0">
+              <span className="text-xs font-bold text-white uppercase tracking-wider">Profile</span>
+              <span className="text-[10px] text-slate-500 font-medium truncate">Standard Member</span>
+            </div>
+          )}
+        </div>
       </div>
     </motion.aside>
   );

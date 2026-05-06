@@ -159,11 +159,11 @@ export default function ModelSettings({ isOpen, onClose, onSelect, activeModelId
             className="relative w-full max-w-lg bg-slate-900/90 border border-white/10 rounded-3xl shadow-2xl p-6 overflow-hidden max-h-full flex flex-col"
           >
             <div className="flex items-center justify-between mb-6">
-              <div className="flex items-center gap-3">
-                <div className="p-2 bg-indigo-500/10 rounded-xl text-indigo-400">
+              <div className="flex items-center gap-4">
+                <div className="p-2 bg-indigo-500/10 rounded-xl text-indigo-400 shrink-0">
                   <Cpu className="w-5 h-5" />
                 </div>
-                <h2 className="text-xl font-bold text-white">Model Settings</h2>
+                <h2 className="text-xl font-bold text-white whitespace-nowrap">Model Settings</h2>
               </div>
               <button
                 onClick={onClose}

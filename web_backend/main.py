@@ -128,8 +128,7 @@ _LOG_QUEUE_MAX = 5000
 
 async def push_phone_transcript(role: str, text: str, is_partial: bool = False):
     """Push a phone-call transcript line to all connected browser /ws clients."""
-    clean = re.sub(r'\[.*?\]', '', text).strip()
-    payload = json.dumps({"type": "transcript", "data": {"role": role, "text": clean, "is_partial": is_partial}})
+    payload = json.dumps({"type": "transcript", "data": {"role": role, "text": text.strip(), "is_partial": is_partial}})
     dead = set()
     for client in list(voice_clients):
         try:
@@ -1306,7 +1305,8 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
     # If a new speech_start fires within that window, cancel and keep accumulating
     # — this prevents chopping a sentence with brief mid-pauses into many turns.
     pending_process_task: asyncio.Task | None = None
-    ENDPOINT_DEBOUNCE_S = 0.4  # [Refinement] Reduced from 0.5 for snappier response
+    ENDPOINT_DEBOUNCE_S = 0.25  # used when AI is not speaking — gives user room to pause
+    BARGE_IN_DEBOUNCE_S = 0.05  # used when AI is speaking — barge-in confirmation runs almost immediately on STT
     MAX_BUFFER_BYTES = 32000 * 30  # 30s ceiling; older audio dropped if exceeded
     # Barge-in state: ai_speaking flips True inside tts_worker while audio is
     # actively streaming to the RPi. speech_end uses this to decide whether
@@ -1405,21 +1405,93 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
             np.clip(audio, -1.0, 1.0, out=audio)
         return audio
 
+    # Whisper's well-known silence/echo hallucinations on Hindi phone audio.
+    # Pattern matches stand-alone English one-liners that Whisper emits when
+    # the input is near-silence or AI bleed-back. Real Hindi speech is in
+    # Devanagari and never matches; real code-switch English ("ok thanks bhai",
+    # "मेरा name X है") has Hindi context around it and won't match either.
+    _WHISPER_HALLUCINATION_RE = re.compile(
+        r'^(bye|okay|ok|thank you|thanks|thanks for watching|please subscribe|'
+        r'subscribe|i|you|yeah|yes|hello|hi|hmm|mmm|uh|um|the|so|well|right|'
+        r'thank you for watching|thanks for watching the video|bye-bye)[.!?,\s]*$',
+        re.IGNORECASE,
+    )
+
+    def _is_whisper_hallucination(text: str) -> bool:
+        """True if the Whisper output looks like a silence/echo hallucination
+        rather than real speech."""
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        # Pure-ASCII short result on a Hindi-primary call ⇒ almost always a
+        # hallucination. Real code-switch English usually has Devanagari
+        # context. Keep this gate cheap — single regex + length check.
+        if len(stripped) <= 25 and _WHISPER_HALLUCINATION_RE.match(stripped):
+            return True
+        # No Devanagari char in a result ≤ 30 chars on a Hindi line is suspect.
+        if len(stripped) <= 30 and not re.search(r'[ऀ-ॿ]', stripped):
+            return True
+        return False
+
     async def _run_stt(pcm_16k: bytes) -> str:
-        """Standalone STT — returns transcript or empty string on failure."""
+        """Standalone STT — returns transcript or empty string on failure.
+        When the configured cloud STT (Sarvam) returns empty, fall back to
+        local Whisper so a marginal-quality utterance still reaches the LLM."""
         audio_np = _preprocess_for_stt(pcm_16k)
         if audio_np.size < 1600:  # <100ms after trim — nothing to transcribe
             return ""
+
+        async def _whisper_fallback() -> str:
+            def _transcribe():
+                model = _models.load_whisper()
+                # Force Hindi. With language=None, Whisper auto-detects English on
+                # phone-line noise/echo and hallucinates 'Bye.', 'Okay.', 'Thank you.',
+                # 'I', etc. Hindi-forced still passes through English code-switch words
+                # (नाम, ID, ok) when they're actually present in the speech.
+                # no_speech_threshold tightened from 0.6 → 0.75 — phone echo had RMS
+                # high enough to dodge 0.6, hence the 'Bye.' hallucinations.
+                segs, _ = model.transcribe(
+                    audio_np, language="hi", beam_size=1,
+                    vad_filter=True, no_speech_threshold=0.75,
+                    condition_on_previous_text=False,
+                )
+                return " ".join(s.text.strip() for s in segs).strip()
+            try:
+                return (await asyncio.to_thread(_transcribe)) or ""
+            except Exception as e:
+                print(f"[Phone] Whisper fallback error: {e}", flush=True)
+                return ""
+
         stt_client = getattr(app.state, 'stt_client', None)
         try:
             if stt_client is not None and hasattr(stt_client, 'transcribe'):
-                return (await stt_client.transcribe(audio_np)) or ""
-            def _transcribe():
-                model = _models.load_whisper()
-                segs, _ = model.transcribe(audio_np, language="hi", beam_size=1,
-                                           vad_filter=True, no_speech_threshold=0.6)
-                return " ".join(s.text.strip() for s in segs).strip()
-            return (await asyncio.to_thread(_transcribe)) or ""
+                primary = (await stt_client.transcribe(audio_np)) or ""
+                if primary:
+                    return primary
+                # Sarvam returned empty. For short audio (<1.5s of post-trim signal),
+                # this is overwhelmingly echo/noise on a Hindi line — running Whisper
+                # almost always produces a hallucination ('Thank you.', 'Bye.', etc.).
+                # Skip Whisper for these. Sarvam handles real Hindi short utterances
+                # like 'नमस्ते' / 'हेलो' fine on its own; if it returned empty, trust it.
+                trimmed_secs = audio_np.size / 16000.0
+                if trimmed_secs < 1.5:
+                    print(f"[Phone] Sarvam empty on {trimmed_secs:.1f}s audio — skipping Whisper (likely echo)", flush=True)
+                    return ""
+                provider_name = getattr(stt_client, "name", "primary")
+                print(f"[Phone] {provider_name} STT empty, trying Whisper fallback...", flush=True)
+                await broadcast_log("status", f"[Phone] {provider_name} empty → Whisper fallback")
+                fb = await _whisper_fallback()
+                if fb and _is_whisper_hallucination(fb):
+                    # Sarvam (Hindi-tuned) said empty but Whisper produced an English
+                    # one-liner — that's overwhelmingly Whisper's silence-hallucination
+                    # signature, not real speech. Trust Sarvam's "empty" and drop it.
+                    print(f"[Phone] Dropped Whisper hallucination: {fb!r}", flush=True)
+                    await broadcast_log("status", f"[Phone] Dropped Whisper hallucination: {fb!r}")
+                    return ""
+                if fb:
+                    print(f"[Phone] Whisper fallback recovered: {fb!r}", flush=True)
+                return fb
+            return await _whisper_fallback()
         except Exception as e:
             print(f"[Phone] STT error: {e}", flush=True)
             return ""
@@ -1475,20 +1547,36 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
         # Reuse the STT result — no need to transcribe the same audio twice.
         await process_utterance(pcm_16k, precomputed_transcript=transcript)
 
+    # Bracketed acoustic tags ([laughter], [sigh], [sniff], [dissatisfaction-hnn], etc.).
+    # OmniVoice in this setup speaks them literally / produces noise instead of the
+    # intended sound effect, so we strip ALL of them before TTS. Complete and partial
+    # tags both go. The dashboard event_handler already strips them for the UI.
+    _TAG_RE = re.compile(r'\[[^\]]*\]?')
+
+    # Emojis & misc symbols. The LLM keeps inserting 🤔/😄/etc. in its replies.
+    # OmniVoice doesn't speak them, but the dirty fallback path produces noises
+    # like 'मोहें' for 😄. Strip them outright. Range covers emoji blocks +
+    # dingbats + symbols. Devanagari and ASCII punctuation are untouched.
+    _EMOJI_RE = re.compile(
+        "[" "\U0001F300-\U0001F6FF" "\U0001F900-\U0001F9FF"
+        "\U0001FA00-\U0001FAFF" "☀-➿" "\U0001F1E6-\U0001F1FF" "]+",
+        flags=re.UNICODE,
+    )
+
     def _clean_tags(text: str) -> str:
-        """Removes incomplete emotion tags like '[lau' or lone '[' from the end of text."""
-        text = text.strip()
-        # Case 1: Ends with a naked opening bracket
-        if text.endswith("["):
-            return text[:-1].strip()
-        # Case 2: Contains an opening bracket that is never closed
-        last_open = text.rfind("[")
-        if last_open != -1:
-            last_close = text.rfind("]", last_open)
-            if last_close == -1:
-                # The tag is incomplete, e.g. "Hello [lau"
-                return text[:last_open].strip()
-        return text
+        """Strip every [tag] except whitelisted acoustic ones and emojis from text."""
+        ALLOWED = ["laughter", "sigh", "sniff", "dissatisfaction-hnn"]
+        
+        def filter_tags(match):
+            content = match.group(0).lower().strip("[] ")
+            if content in ALLOWED:
+                return match.group(0)
+            return ""
+            
+        cleaned = re.sub(r'\[.*?\]', filter_tags, text)
+        cleaned = _EMOJI_RE.sub('', cleaned)
+        # Collapse the double-spaces left where tags/emojis used to be.
+        return re.sub(r'\s+', ' ', cleaned).strip()
 
     async def process_utterance(pcm_16k: bytes, precomputed_transcript: str | None = None):
         nonlocal processing, call_history, ai_speaking
@@ -1532,6 +1620,38 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
             audio_ready_queue: asyncio.Queue = asyncio.Queue(maxsize=3)
             tts_chunk_count = [0]
 
+            def _trim_chunk_silence(audio_16k: bytes) -> bytes:
+                """Trim leading/trailing silence from a 16kHz PCM16 chunk.
+                OmniVoice tends to leave 100-300ms of near-silence at chunk edges,
+                which creates audible seams when consecutive chunks play
+                back-to-back. Stripping the silence makes them fuse like a single
+                continuous utterance — the smooth-speech feel the user is asking
+                for. Threshold is conservative so genuine soft phonemes survive."""
+                if len(audio_16k) < 320:  # < 10ms — nothing to trim
+                    return audio_16k
+                arr = np.frombuffer(audio_16k, dtype=np.int16).astype(np.float32) / 32768.0
+                if arr.size == 0:
+                    return audio_16k
+                # 16ms windows — fine enough to catch the silence boundary cleanly.
+                win = 256
+                n_frames = arr.size // win
+                if n_frames < 4:
+                    return audio_16k
+                frames = arr[: n_frames * win].reshape(n_frames, win)
+                rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-9)
+                # Threshold: 1% of peak RMS, floored at 0.005. Captures actual
+                # silence but leaves quiet phonemes alone.
+                peak = float(rms.max())
+                thresh = max(0.005, peak * 0.01)
+                voiced = np.where(rms > thresh)[0]
+                if voiced.size == 0:
+                    return audio_16k
+                # Keep ~30ms of head/tail so the trim doesn't clip a phoneme onset.
+                start = max(0, voiced[0] - 2) * win
+                end = min(n_frames, voiced[-1] + 3) * win
+                trimmed = arr[start:end]
+                return (np.clip(trimmed, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+
             async def tts_synthesizer_worker():
                 """Synthesizes text sentences into audio buffers in background."""
                 try:
@@ -1544,6 +1664,7 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                         if audio:
                             # 24kHz PCM -> 16kHz PCM. Bridge does 16k -> 8k ulaw on the wire.
                             audio_16k, _ = audioop.ratecv(audio, 2, 1, 24000, 16000, None)
+                            audio_16k = _trim_chunk_silence(audio_16k)
                             await audio_ready_queue.put((text, audio_16k))
                 except Exception as e:
                     print(f"[Phone] Synthesizer worker failed: {e}", flush=True)
@@ -1559,17 +1680,30 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                         ai_speaking = True
                         tts_chunk_count[0] += 1
                         await broadcast_log("status", f"[Phone] Playing TTS chunk {tts_chunk_count[0]}: {text[:50]!r}")
-                        # Emit the exact text being spoken for karaoke-style word highlighting
-                        await broadcast_log("phone_tts_speaking", text)
-                        
-                        # Send audio and WAIT for it to play out on the phone.
-                        # This ensures ai_speaking remains True during the actual speech,
-                        # which is critical for the barge-in (interrupt) system to work.
-                        await _send_to_bridge(audio)
-                        # 16kHz LE PCM16 = 32000 B/s; sleep so ai_speaking stays True for the whole playback.
+
+                        # Send audio first so the wire is busy while we tick out the karaoke.
+                        # 120ms lookahead — start fetching the next chunk while the bridge
+                        # still has ~120ms of current chunk in its play queue, so consecutive
+                        # chunks fuse without an audible 'ruk-ruk' seam.
                         duration = len(audio) / 32000.0
-                        await asyncio.sleep(duration)
-                        
+                        await _send_to_bridge(audio)
+
+                        # Karaoke: progressively reveal words at the speaking pace so the
+                        # dashboard highlights word-by-word like ChatGPT/Gemini Live, instead
+                        # of dumping the whole chunk text at once and then sitting idle.
+                        words = text.split()
+                        if words and duration > 0.05:
+                            per_word = max(0.0, (duration - 0.12)) / len(words)
+                            shown = ""
+                            for w in words:
+                                shown = (shown + " " + w).strip()
+                                await broadcast_log("phone_tts_speaking", shown)
+                                if per_word > 0:
+                                    await asyncio.sleep(per_word)
+                        else:
+                            await broadcast_log("phone_tts_speaking", text)
+                            await asyncio.sleep(max(0, duration - 0.12))
+
                         await broadcast_log("status", f"[Phone] Played chunk {tts_chunk_count[0]} ({int(duration*1000)}ms)")
                 finally:
                     ai_speaking = False
@@ -1582,9 +1716,14 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
             tts_task = asyncio.gather(synth_task, play_task)
 
             llm_t0 = time.time()
-            # Sentence delimiters: Hindi danda, !, ?, and period not between digits. 
-            # Using capturing groups () so punctuation is preserved in the split list.
-            SENT_RE = re.compile(r'([।!?]|(?<=[^\d])\.(?=[^\d]))')
+            # Sentence delimiters: Hindi danda, !, ?, and period not between digits.
+            # Used to find the LAST boundary in the buffer so we never cut mid-word.
+            SENT_RE = re.compile(r'[।!?]|(?<=[^\d])\.(?=[^\d]|$)')
+            # First chunk goes out fast (low TTFT) once we have a small phrase.
+            # Subsequent chunks aggregate more so prosody doesn't reset every 2-3 words.
+            FIRST_CHUNK_MIN_WORDS = 3
+            CHUNK_MIN_WORDS = 6
+            CHUNK_HARD_MAX_WORDS = 14  # force-flush even without punctuation
 
             try:
                 messages = [
@@ -1600,10 +1739,31 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                 
                 full_response = ""
                 sentence_buf = ""
-                # Batching logic: combine short phrases/tags to avoid robotic 'ruk-ruk' speech.
-                current_batch = []
                 first_token = True
-                
+                first_chunk_sent = False
+
+                def _split_safe_chunk(buf: str, min_words: int) -> tuple[str, str]:
+                    """Carve a TTS-ready chunk out of `buf` without splitting words.
+                    Strategy:
+                      1. If buf has sentence punctuation, split AT the LAST one — send
+                         the prefix (incl. punctuation), keep the tail for the next sentence.
+                         This kills the 'बताइए! क्' / 'या हाल है?' mid-word artifact.
+                      2. Else if buf is past the hard word cap, split at the last whitespace
+                         so prosody flows but no word is cut.
+                      3. Else return ('', buf) — keep buffering.
+                    Returns (chunk, remainder)."""
+                    matches = list(SENT_RE.finditer(buf))
+                    if matches:
+                        last = matches[-1]
+                        prefix = buf[: last.end()]
+                        if len(prefix.split()) >= min_words:
+                            return prefix, buf[last.end():]
+                    if len(buf.split()) >= CHUNK_HARD_MAX_WORDS:
+                        last_ws = buf.rfind(" ")
+                        if last_ws > 0:
+                            return buf[:last_ws], buf[last_ws + 1:]
+                    return "", buf
+
                 # Strip think tags if model is reasoning-capable (engine-style)
                 think_state = {"in_think": False, "tail": ""}
 
@@ -1611,8 +1771,6 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                     async with client.stream("POST", provider.url,
                                              headers=provider.headers(),
                                              json=payload) as resp:
-                        import typing
-                        resp = typing.cast(httpx.Response, resp)
                         if resp.status_code != 200:
                             err_txt = await resp.aread()
                             print(f"[Phone] LLM Error {resp.status_code}: {err_txt.decode()}", flush=True)
@@ -1625,11 +1783,19 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                             if line.startswith("data: "):
                                 try:
                                     chunk_data = json.loads(line[6:])
-                                    delta = (chunk_data.get("choices", [{}])[0]
-                                             .get("delta", {}).get("content") or "")
+                                    choice0 = chunk_data.get("choices", [{}])[0]
+                                    delta = (choice0.get("delta", {}).get("content") or "")
+                                    finish_reason = choice0.get("finish_reason")
+                                    if finish_reason and finish_reason != "stop":
+                                        # 'length' = max_tokens hit (truncated mid-word).
+                                        # 'content_filter' = provider blocked. Either way,
+                                        # surface it so the user knows why the reply ended.
+                                        print(f"[Phone] LLM finish_reason={finish_reason!r}", flush=True)
+                                        await broadcast_log("system",
+                                            f"[Phone] LLM finish_reason={finish_reason}")
                                     if not delta:
                                         continue
-                                    
+
                                     # Strip thinking tokens (engine-style)
                                     clean_delta = _strip_think_streaming(delta, think_state)
                                     if not clean_delta:
@@ -1645,40 +1811,43 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                                     await push_phone_transcript("ai", full_response, is_partial=True)
                                     await broadcast_log("phone_ai_partial", full_response)
                                     sentence_buf += clean_delta
-                                    
-                                    # Use 'Split and Pop' logic but PRESERVE the punctuation.
-                                    # Capturing groups () in re.split keep the delimiters in the list.
-                                    parts = SENT_RE.split(sentence_buf)
-                                    if len(parts) > 2: # At least one [text, delim, text]
-                                        # We can join pairs of (text, delim)
-                                        # e.g. ['जी', '!', ' बताइए', '।', ' यार']
-                                        # to_process will be [parts[0]+parts[1], parts[2]+parts[3], ...]
-                                        to_process = []
-                                        # The last part is always the incomplete trailing text
-                                        for i in range(0, len(parts) - 1, 2):
-                                            to_process.append(parts[i] + parts[i+1])
-                                        
-                                        sentence_buf = parts[-1]
-                                        
-                                        for s in to_process:
-                                            s = _clean_tags(s)
-                                            if not s: continue
-                                            current_batch.append(s)
-                                            
-                                            batch_txt = " ".join(current_batch)
-                                            # Flush if the batch is long enough for natural intonation
-                                            if len(batch_txt) > 30: # Reduced from 50 for snappier endings
-                                                await tts_queue.put(batch_txt)
-                                                current_batch = []
+
+                                    # Smooth chunking: send first chunk fast for low TTFT,
+                                    # then aggregate larger chunks so prosody doesn't reset
+                                    # every 2-3 words. _split_safe_chunk never cuts mid-word.
+                                    min_words = (FIRST_CHUNK_MIN_WORDS
+                                                 if not first_chunk_sent
+                                                 else CHUNK_MIN_WORDS)
+                                    chunk, sentence_buf = _split_safe_chunk(sentence_buf, min_words)
+                                    if chunk:
+                                        text_to_speak = _clean_tags(chunk).strip()
+                                        # Drop tiny fragments like 'u', 'ug' that produce
+                                        # garbled audio (typically tag bracket leakage).
+                                        if len(text_to_speak) >= 3:
+                                            await tts_queue.put(text_to_speak)
+                                            first_chunk_sent = True
                                 except (json.JSONDecodeError, IndexError, KeyError):
                                     pass
 
-                        # Final flush: combine everything left
-                        final_txt = _clean_tags(" ".join(current_batch) + " " + sentence_buf)
-                        if final_txt:
+                        # Stream ended. _strip_think_streaming holds back up to 7 chars
+                        # at every chunk boundary so it can detect a '<think>'/'</think>'
+                        # tag split across chunks. At end-of-stream those chars are stuck
+                        # in think_state["tail"] — without this flush we'd silently drop
+                        # the last 3-7 characters of EVERY response (the 'कैस' instead of
+                        # 'कैसे हैं?' truncation).
+                        if not think_state.get("in_think") and think_state.get("tail"):
+                            tail = think_state["tail"]
+                            think_state["tail"] = ""
+                            full_response += tail
+                            sentence_buf += tail
+                            await push_phone_transcript("ai", full_response, is_partial=True)
+                            await broadcast_log("phone_ai_partial", full_response)
+
+                        # Final flush: send whatever is left in the buffer.
+                        final_txt = _clean_tags(sentence_buf).strip()
+                        if len(final_txt) >= 1:
                             await tts_queue.put(final_txt)
                         sentence_buf = ""
-                        current_batch = []
             except asyncio.CancelledError:
                 # Barge-in kills this task. We MUST kill the tts_worker too, 
                 # otherwise it keeps playing the remaining queue!
@@ -1776,6 +1945,10 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                     # NOTE: do NOT clear stt_buffer here. Continuations within the
                     # debounce window must concatenate so STT sees a complete sentence.
                     stt_resample_state = None
+                    # We do NOT barge-in on speech_start: the phone speaker leaks the
+                    # AI's own audio back into the mic, so VAD fires speech_start
+                    # constantly during AI playback. Barge-in is gated on STT confirming
+                    # substantive user speech (see speech_end → mid-speech path).
 
                 elif t == "speech_end":
                     buf_bytes = len(stt_buffer)
@@ -1806,7 +1979,10 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                                     spec_task = asyncio.create_task(stt_client.transcribe(spec_audio))
 
                             try:
-                                await asyncio.sleep(ENDPOINT_DEBOUNCE_S)
+                                # Shorter debounce while the AI is speaking — we want
+                                # the barge-in confirmation (STT result) on screen ASAP.
+                                debounce = BARGE_IN_DEBOUNCE_S if ai_speaking else ENDPOINT_DEBOUNCE_S
+                                await asyncio.sleep(debounce)
                             except asyncio.CancelledError:
                                 if spec_task and not spec_task.done():
                                     spec_task.cancel()
@@ -1834,11 +2010,18 @@ async def phone_websocket(websocket: WebSocket, voice_id: str = "ravi"):
                                 # No new audio came during the debounce — speculative
                                 # transcription is a valid hit; saves an STT round trip.
                                 try:
-                                    # Ensure result is typed as str for the checker
-                                    transcript = str(await spec_task)
-                                    if transcript:
+                                    spec_result = str(await spec_task)
+                                    if spec_result:
+                                        transcript = spec_result
                                         print(f"[Phone] Speculative STT hit", flush=True)
-                                except Exception:
+                                    else:
+                                        # Empty result from speculative STT — leave transcript=None so
+                                        # process_utterance falls through to _run_stt (which has the
+                                        # Whisper fallback when Sarvam returns empty).
+                                        print(f"[Phone] Speculative STT returned empty — retrying via fallback path", flush=True)
+                                        await broadcast_log("status", "[Phone] Sarvam returned empty, retrying...")
+                                except Exception as e:
+                                    print(f"[Phone] Speculative STT error: {e}", flush=True)
                                     transcript = None
                             elif spec_task is not None:
                                 # Audio grew during debounce; drop the stale speculative.
@@ -1914,10 +2097,6 @@ async def websocket_endpoint(websocket: WebSocket):
     async def event_handler(msg_type, data):
         """Callback from engine to send data to WebSocket."""
         try:
-            # Clean transcript for UI (remove emotional tags like [laughter])
-            if msg_type == "transcript" and "text" in data:
-                data["text"] = re.sub(r'\[.*?\]', '', data["text"]).strip()
-
             # Broadcast all non-audio events to the LOG viewer too
             if msg_type != "audio_chunk":
                 await broadcast_log(msg_type, data)

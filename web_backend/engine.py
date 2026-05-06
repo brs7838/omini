@@ -128,60 +128,52 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REF_AUDIO_PATH = os.path.join(ROOT_DIR, "assets", "voices", "ravi_sir_8s.wav")
 
 def clean_text(text):
-    """Zero-Tolerance Tag Guard: Validates and whitelists only supported OmniVoice acoustic tags.
-    Strips away ANY other bracketed content to prevent hallucinations.
+    """Refined Tag Guard: Preserves whitelisted OmniVoice acoustic tags and punctuation markers.
+    Strips away unsupported bracketed content and non-essential markdown.
     """
-    # 1. Supported Tags Whitelist (Lowercase for matching)
     ALLOWED_TAGS = ["laughter", "sigh", "sniff", "dissatisfaction-hnn"]
     
-    # 2. Extract and Validate all bracketed tags [...]
-    def validate_and_protect(match):
+    # 1. Protect whitelisted tags using placeholders
+    tag_map = {}
+    def protect_tag(match):
         content = match.group(1).lower().strip()
+        # Mapping for common variations
         mapping = {
             "हँसी": "laughter", "हंसी": "laughter", "haha": "laughter",
             "आह": "sigh", "sigh": "sigh",
             "स्निफ़": "sniff", "sniff": "sniff",
             "हम्म": "dissatisfaction-hnn", "हूँ": "dissatisfaction-hnn", "hnn": "dissatisfaction-hnn"
         }
-        normalized = mapping.get(content, content)
-        if normalized in ALLOWED_TAGS:
-            return f"[{normalized}]"
-        return "" # Delete non-whitelisted brackets
+        tag = mapping.get(content, content)
+        if tag in ALLOWED_TAGS:
+            placeholder = f"§§TAG_{len(tag_map)}§§"
+            tag_map[placeholder] = f"[{tag}]"
+            return placeholder
+        return "" # Strip unknown tags
     
-    # Apply the validator
-    text = re.sub(r'\[(.*?)\]', validate_and_protect, text)
+    text = re.sub(r'\[(.*?)\]', protect_tag, text)
 
-    # 3. Standard Text Cleaning
-    tag_map = {}
-    def hide_tag(match):
-        placeholder = f"§§{len(tag_map)}§§"
-        tag_map[placeholder] = match.group(0)
-        return placeholder
-    
-    text = re.sub(r'\[.*?\]', hide_tag, text)
+    # 2. Markdown and Symbol Cleaning
     text = re.sub(r'#+\s*', '', text)
     text = text.replace('**', '').replace('*', '')
-    text = re.sub(r'[\U00010000-\U0010ffff]', '', text)
-    # text = re.sub(r'[a-zA-Z]', '', text) # DELETED: Removing Roman characters was causing Hinglish silence.
+    text = re.sub(r'[\U00010000-\U0010ffff]', '', text) # Strip Emojis for TTS
     
-    # --- OmniVoice Native Hindi Punctuation Formatting ---
-    # To prevent "breathlessness" and "fluctuations" in long paragraphs:
-    # 1. OmniVoice Hindi expects Devanagari Danda for full stops.
+    # 3. Punctuation Formatting (Guide-compliant)
+    # The guide says '!' brings excitement and '?' raises pitch.
     text = text.replace('.', '।')
-    # 2. Exclamation marks often cause extreme overacting/fluctuating pitch. Map to Danda.
-    text = text.replace('!', '।')
-    # 3. Commas need explicit trailing spaces to guarantee a clean structural pause.
+    # text = text.replace('!', '।') # DELETED: Keeping ! for excitement as per guide
     text = text.replace(',', ', ')
     text = text.replace('?', '? ')
     text = text.replace('-', ' ')
-    # 4. Collapse extra spaces
     text = re.sub(r'\s+', ' ', text)
     
-    # 4. Final Cleanup: Remove any stray brackets that didn't form a valid tag (before restoring placeholders)
-    # This prevents the AI from saying "k" or click-sounds for single brackets
+    # 4. Strip any stray brackets and non-essential characters
+    # We keep Devanagari, Basic Latin, and common punctuation.
+    # This prevents the TTS from trying to read weird symbols with a bad accent.
+    text = re.sub(r'[^a-zA-Z0-9\u0900-\u097F\s।?,!§]', '', text)
     text = re.sub(r'[\[\]]', '', text)
 
-    # Restore original tags
+    # 5. Restore original tags
     for placeholder, original in tag_map.items():
         text = text.replace(placeholder, original)
     
@@ -676,7 +668,7 @@ class WebAssistant:
                             sentence = ""
                             full_response = ""
                             think_state = {"in_think": False, "tail": ""}
-                            await self.emit("status", "thinking")
+                            # await self.emit("status", "thinking")
 
                             # Smart backchannel gating
                             now = time.time()
@@ -696,7 +688,6 @@ class WebAssistant:
                             sentence_end_re = re.compile(r"(\n\n)")
                             print(f"[LLM] Starting stream request to: {self.llm_url} (model={self.llm_model})", flush=True)
                             async with client.stream("POST", self.llm_url, json=payload, headers=self.llm_headers or None) as response:
-                                response = cast(httpx.Response, response)
                                 if response.status_code != 200:
                                     err_body = await response.aread()
                                     print(f"[LLM] API ERROR (status={response.status_code}) url={self.llm_url}: {err_body.decode(errors='ignore')}", flush=True)
