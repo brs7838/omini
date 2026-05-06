@@ -1,6 +1,6 @@
 "use client";
 
-import { X, Cpu, Check, Loader2, Server, Cloud, Zap } from "lucide-react";
+import { X, Cpu, Check, Loader2, Server, Cloud, Zap, Terminal } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useState, useEffect, useCallback } from "react";
 
@@ -9,7 +9,7 @@ interface Model {
   name: string;
 }
 
-type ProviderName = "ollama" | "sarvam" | "minimax";
+type ProviderName = "ollama" | "sarvam" | "minimax" | "llamacpp";
 
 interface ProviderState {
   provider: ProviderName;
@@ -54,6 +54,18 @@ export default function ModelSettings({ isOpen, onClose, onSelect, activeModelId
         { id: "MiniMax-M2.7",             name: "MiniMax M2.7 - Thinking" },
         { id: "MiniMax-M2.5-non-thinking", name: "MiniMax M2.5 - Non-Thinking" },
         { id: "MiniMax-M2.7-non-thinking", name: "MiniMax M2.7 - Non-Thinking" },
+      ];
+    }
+    if (provider === "llamacpp") {
+      return [
+        { id: "default",                           name: "Currently Loaded Model" },
+        { id: "gemma-3-4b-it-Q4_K_M",              name: "Gemma 3 (4B) Q4_K_M" },
+        { id: "gemma-3-12b-it-Q4_K_M",             name: "Gemma 3 (12B) Q4_K_M" },
+        { id: "Phi-4-mini-instruct-Q4_K_M",        name: "Phi 4 Mini Q4_K_M" },
+        { id: "Qwen3-4B-Q4_K_M",                   name: "Qwen 3 (4B) Q4_K_M" },
+        { id: "Qwen3-8B-Q4_K_M",                   name: "Qwen 3 (8B) Q4_K_M" },
+        { id: "Llama-3.2-3B-Instruct-Q4_K_M",      name: "Llama 3.2 (3B) Q4_K_M" },
+        { id: "Mistral-7B-Instruct-v0.3-Q4_K_M",   name: "Mistral 7B v0.3 Q4_K_M" },
       ];
     }
     return [
@@ -185,7 +197,7 @@ export default function ModelSettings({ isOpen, onClose, onSelect, activeModelId
                   </span>
                 )}
               </div>
-              <div className="grid grid-cols-3 gap-2 p-1 rounded-2xl bg-white/[0.03] border border-white/5">
+              <div className="grid grid-cols-4 gap-2 p-1 rounded-2xl bg-white/[0.03] border border-white/5">
                 <ProviderPill
                   active={viewedProvider === "ollama"}
                   isBackendActive={providerState?.provider === "ollama"}
@@ -195,6 +207,16 @@ export default function ModelSettings({ isOpen, onClose, onSelect, activeModelId
                   label="Ollama"
                   sub="Local · RTX 3060"
                   accent="emerald"
+                />
+                <ProviderPill
+                  active={viewedProvider === "llamacpp"}
+                  isBackendActive={providerState?.provider === "llamacpp"}
+                  loading={false}
+                  onClick={() => handleViewProvider("llamacpp")}
+                  icon={<Terminal className="w-3.5 h-3.5" />}
+                  label="llama.cpp"
+                  sub="Local · GGUF"
+                  accent="amber"
                 />
                 <ProviderPill
                   active={viewedProvider === "sarvam"}
@@ -270,8 +292,8 @@ export default function ModelSettings({ isOpen, onClose, onSelect, activeModelId
             </div>
 
             <div className="mt-5 p-3.5 bg-white/5 rounded-2xl border border-white/5">
-              <p className="text-[10px] text-slate-500 leading-relaxed">
-                <span className="text-indigo-400 font-bold">INFO:</span> Switching to Sarvam evicts Ollama from GPU (frees VRAM). Switching back warms the selected model before your next turn.
+               <p className="text-[10px] text-slate-500 leading-relaxed">
+                <span className="text-indigo-400 font-bold">INFO:</span> Switching to Sarvam/MiniMax evicts Ollama from GPU (frees VRAM). llama.cpp runs its own server — start <code className="text-amber-400/80">llama-server</code> with your GGUF before switching. Switching back to Ollama warms the selected model before your next turn.
               </p>
             </div>
           </motion.div>
@@ -291,12 +313,14 @@ function ProviderPill({
   icon: React.ReactNode;
   label: string;
   sub: string;
-  accent: "emerald" | "indigo";
+  accent: "emerald" | "indigo" | "amber";
 }) {
   const activeCls =
     accent === "emerald"
       ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-300"
-      : "bg-indigo-500/15 border-indigo-500/30 text-indigo-300";
+      : accent === "amber"
+        ? "bg-amber-500/15 border-amber-500/30 text-amber-300"
+        : "bg-indigo-500/15 border-indigo-500/30 text-indigo-300";
   return (
     <button
       disabled={loading}

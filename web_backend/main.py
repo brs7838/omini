@@ -280,10 +280,11 @@ async def lifespan(app):
 
     # Resolve the active LLM provider once at startup. Local Ollama gets a GPU
     # prewarm; remote APIs (Sarvam) are HTTP-only so we skip all local warmup.
+    # llama.cpp is local but manages its own model loading — no Ollama API.
     active_provider = resolve_provider()
     print(f"[Startup] LLM provider: {active_provider.name} model={active_provider.model}")
 
-    if active_provider.uses_local_gpu:
+    if active_provider.name == "ollama":
         # Prewarm Ollama with FULL GPU offload (num_gpu=99). Cuts TTFT from
         # ~400 ms (CPU) to ~100 ms (GPU). num_ctx=1024 keeps KV cache small.
         print("[Startup] Pre-warming Ollama on CPU (num_gpu=0, num_ctx=4096)...")
@@ -298,8 +299,21 @@ async def lifespan(app):
             print("[Startup] Ollama pre-warmed on CPU.")
         except Exception as e:
             print(f"[Startup] Ollama pre-warm skipped: {e}")
+    elif active_provider.name == "llamacpp":
+        # llama.cpp server manages its own GGUF loading — just verify reachability.
+        print("[Startup] Checking llama.cpp server health...")
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                health_url = active_provider.url.replace("/v1/chat/completions", "/health")
+                r = await client.get(health_url)
+                if r.status_code == 200:
+                    print("[Startup] llama.cpp server is healthy.")
+                else:
+                    print(f"[Startup] llama.cpp server returned status {r.status_code}.")
+        except Exception as e:
+            print(f"[Startup] llama.cpp health check failed (server may not be running): {e}")
     else:
-        # Active provider is remote (Sarvam). If ollama.exe is still running
+        # Active provider is remote (Sarvam/MiniMax). If ollama.exe is still running
         # from a previous session (launcher skipped the taskkill, manual
         # backend restart, etc.), it may be holding models in VRAM that
         # OmniVoice now needs. Evict them proactively — no-op if Ollama isn't
@@ -323,7 +337,7 @@ async def lifespan(app):
         "pid": os.getpid(),
         "windows_priority": _priority_class_set
     }
-    if active_provider.uses_local_gpu:
+    if active_provider.name == "ollama":
         boot_manifest["llm_configured_num_gpu"] = 99
         boot_manifest["llm_configured_num_ctx"] = 4096
         try:
@@ -346,6 +360,8 @@ async def lifespan(app):
                     break
         except Exception as e:
             boot_manifest["llm_probe_error"] = f"{type(e).__name__}: {e}"[:200]
+    elif active_provider.name == "llamacpp":
+        boot_manifest["llm_actual_device"] = "local-server"
     else:
         boot_manifest["llm_actual_device"] = "remote-api"
 
@@ -605,7 +621,8 @@ async def get_llm_models():
     """Returns a list of available LLM models for the settings UI.
 
     The list is provider-dependent: local Ollama exposes the GGUF models we've
-    verified, remote Sarvam exposes the Indic tiers from their API docs.
+    verified, remote Sarvam exposes the Indic tiers from their API docs,
+    llama.cpp lists popular GGUF models the user can load.
     """
     # Prefer the live, possibly-switched provider over the env-resolved one so
     # the UI reflects post-/provider/switch state instead of boot-time state.
@@ -615,6 +632,17 @@ async def get_llm_models():
             {"id": "sarvam-m",    "name": "Sarvam M (24B) - Average"},
             {"id": "sarvam-30b",  "name": "Sarvam 30B - High IQ"},
             {"id": "sarvam-105b", "name": "Sarvam 105B - Flagship"},
+        ]
+    if provider.name == "llamacpp":
+        return [
+            {"id": "default",                  "name": "Currently Loaded Model"},
+            {"id": "gemma-3-4b-it-Q4_K_M",     "name": "Gemma 3 (4B) Q4_K_M"},
+            {"id": "gemma-3-12b-it-Q4_K_M",    "name": "Gemma 3 (12B) Q4_K_M"},
+            {"id": "Phi-4-mini-instruct-Q4_K_M", "name": "Phi 4 Mini Q4_K_M"},
+            {"id": "Qwen3-4B-Q4_K_M",         "name": "Qwen 3 (4B) Q4_K_M"},
+            {"id": "Qwen3-8B-Q4_K_M",         "name": "Qwen 3 (8B) Q4_K_M"},
+            {"id": "Llama-3.2-3B-Instruct-Q4_K_M", "name": "Llama 3.2 (3B) Q4_K_M"},
+            {"id": "Mistral-7B-Instruct-v0.3-Q4_K_M", "name": "Mistral 7B v0.3 Q4_K_M"},
         ]
     return [
         {"id": "gemma3:4b", "name": "Gemma 3 (4B) - Default"},
@@ -758,7 +786,7 @@ async def force_unload_ollama():
 
 
 class ProviderSwitchBody(BaseModel):
-    provider: str            # "ollama" | "sarvam"
+    provider: str            # "ollama" | "sarvam" | "minimax" | "llamacpp"
     model: str | None = None
 
 
@@ -778,7 +806,7 @@ async def switch_provider(body: ProviderSwitchBody, request: Request):
         untouched — the UI shouldn't end up pointing at a broken backend.
     """
     new_name = (body.provider or "").lower().strip()
-    if new_name not in ("ollama", "sarvam", "minimax"):
+    if new_name not in ("ollama", "sarvam", "minimax", "llamacpp"):
         raise HTTPException(status_code=400, detail=f"unknown provider {new_name!r}")
 
     prev = getattr(app.state, "llm_provider", None)
@@ -832,6 +860,20 @@ async def switch_provider(body: ProviderSwitchBody, request: Request):
             # Warm on the way in so the next voice turn doesn't pay cold-load.
             warmed = await ollama_warmup(client, new_provider.model)
             print(f"[Provider] Ollama warmup ({new_provider.model}) -> {warmed}", flush=True)
+        elif new_name == "llamacpp":
+            # llama-server manages its own model loading — no Ollama warmup
+            # needed. Just verify the server is reachable so we can report
+            # a meaningful status to the UI.
+            try:
+                health = await client.get(
+                    new_provider.url.replace("/v1/chat/completions", "/health"),
+                    timeout=3.0,
+                )
+                warmed = health.status_code == 200
+                print(f"[Provider] llama.cpp health check -> {warmed}", flush=True)
+            except Exception as hc_err:
+                warmed = False
+                print(f"[Provider] llama.cpp health check failed: {hc_err}", flush=True)
 
     return {
         "ok": True,

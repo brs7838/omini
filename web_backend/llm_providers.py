@@ -1,17 +1,18 @@
 """Pluggable LLM backends for the voice pipeline.
 
-Both Ollama (local) and Sarvam (HTTP) speak OpenAI-compatible /chat/completions
-with SSE streaming, so the streaming loop in `engine.llm_worker` stays
-identical — only the URL, auth header, model ID, and a small provider-specific
-tail on the request payload differ.
+Ollama, Sarvam, MiniMax, and llama.cpp all speak OpenAI-compatible
+/chat/completions with SSE streaming, so the streaming loop in
+`engine.llm_worker` stays identical — only the URL, auth header,
+model ID, and a small provider-specific tail on the request payload differ.
 
 Selection is via env vars (evaluated per `resolve_provider` call, so a restart
 or reload picks up changes to .env):
 
-    LLM_PROVIDER     "ollama" (default) | "sarvam"
+    LLM_PROVIDER     "ollama" (default) | "sarvam" | "minimax" | "llamacpp"
     LLM_MODEL        Optional override for the provider's default model
     SARVAM_API_KEY   Required when LLM_PROVIDER=sarvam
     OLLAMA_URL       Optional override for the local Ollama endpoint
+    LLAMACPP_URL     Optional override for the llama.cpp server endpoint
 """
 from __future__ import annotations
 
@@ -30,6 +31,9 @@ SARVAM_DEFAULT_MODEL = "sarvam-m"  # mid-tier ("average") Indic LLM
 
 MINIMAX_URL = "https://api.minimax.io/v1/chat/completions"
 MINIMAX_DEFAULT_MODEL = "MiniMax-M2.5"
+
+LLAMACPP_DEFAULT_URL = "http://127.0.0.1:8080/v1/chat/completions"
+LLAMACPP_DEFAULT_MODEL = "default"  # llama-server serves whichever GGUF is loaded
 
 # Persisted provider choice. Sits at project root next to campaigns.json so the
 # user's runtime /provider/switch survives a restart — otherwise each boot
@@ -136,7 +140,7 @@ async def ollama_warmup(http_client, model: str) -> bool:
 
 @dataclass(frozen=True)
 class LLMProvider:
-    name: str                                  # "ollama" | "sarvam"
+    name: str                                  # "ollama" | "sarvam" | "minimax" | "llamacpp"
     url: str
     model: str
     auth_header: Optional[Tuple[str, str]] = None
@@ -176,6 +180,15 @@ class LLMProvider:
         if self.name == "minimax":
             return {
                 "max_tokens": 2048,
+                "temperature": 0.7,
+                "top_p": 0.9,
+            }
+        if self.name == "llamacpp":
+            # llama-server follows OpenAI field names at the top level.
+            # Keep num_predict low for voice latency; n_predict is the
+            # llama.cpp alias but max_tokens works on the /v1 endpoint.
+            return {
+                "max_tokens": 256,
                 "temperature": 0.7,
                 "top_p": 0.9,
             }
@@ -278,9 +291,25 @@ def resolve_provider(
             uses_local_gpu=False,
         )
 
+    if name == "llamacpp":
+        # llama.cpp's built-in HTTP server (llama-server / server.exe) exposes
+        # an OpenAI-compatible /v1/chat/completions endpoint — no auth needed
+        # for local use. The model is whatever GGUF the server was started with;
+        # we store a user-friendly label so the UI can display which model the
+        # user picked. `uses_local_gpu=True` signals that this provider runs
+        # locally, but it does NOT use Ollama's warmup/unload logic — llama-
+        # server manages its own VRAM.
+        return LLMProvider(
+            name="llamacpp",
+            url=os.environ.get("LLAMACPP_URL", LLAMACPP_DEFAULT_URL),
+            model=model_override or LLAMACPP_DEFAULT_MODEL,
+            auth_header=None,
+            uses_local_gpu=True,
+        )
+
     if name != "ollama":
         raise RuntimeError(
-            f"Unknown LLM_PROVIDER={name!r}. Expected 'ollama', 'sarvam', or 'minimax'."
+            f"Unknown LLM_PROVIDER={name!r}. Expected 'ollama', 'sarvam', 'minimax', or 'llamacpp'."
         )
 
     return LLMProvider(
