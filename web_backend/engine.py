@@ -711,9 +711,13 @@ class WebAssistant:
                                         continue
 
                                     choices = body.get("choices") or []
-                                    if not choices: continue
-                                    delta = choices[0].get("delta") or {}
-                                    raw_chunk = delta.get("content") or ""
+                                    if choices:
+                                        delta = choices[0].get("delta") or {}
+                                        raw_chunk = delta.get("content") or ""
+                                    else:
+                                        # llama.cpp native /completion format
+                                        raw_chunk = body.get("content") or ""
+
                                     chunk = _strip_think_streaming(raw_chunk, think_state)
                                     if not chunk: continue
                                     

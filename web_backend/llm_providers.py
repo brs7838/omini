@@ -32,7 +32,7 @@ SARVAM_DEFAULT_MODEL = "sarvam-m"  # mid-tier ("average") Indic LLM
 MINIMAX_URL = "https://api.minimax.io/v1/chat/completions"
 MINIMAX_DEFAULT_MODEL = "MiniMax-M2.5"
 
-LLAMACPP_DEFAULT_URL = "http://127.0.0.1:8080/v1/chat/completions"
+LLAMACPP_DEFAULT_URL = "http://127.0.0.1:8080/completion"
 LLAMACPP_DEFAULT_MODEL = "default"  # llama-server serves whichever GGUF is loaded
 
 # Persisted provider choice. Sits at project root next to campaigns.json so the
@@ -222,29 +222,38 @@ class LLMProvider:
         effective_system += "NEVER output bracketed acoustic tags like [laughter], [sigh], [sniff] or any '[...]' marker — they are read literally on this voice line, not as sound effects. Express emotion through word choice and exclamations instead. "
         effective_system += "Always finish your sentence with proper punctuation — never stop mid-word."
 
-        if self.name == "llamacpp" and messages:
-            # Many llama.cpp templates (like Gemma) are strict about alternating
-            # user/assistant roles and don't have a dedicated 'system' role.
-            # Prepending 'system' often maps it to 'user', causing a 
-            # 'roles must alternate' error. Merge it into the first user msg instead.
-            full_messages = []
-            system_injected = False
-            for m in messages:
-                if not system_injected and m["role"] == "user":
-                    full_messages.append({
-                        "role": "user",
-                        "content": f"{effective_system}\n\nUSER: {m['content']}"
-                    })
-                    system_injected = True
-                else:
-                    full_messages.append(m)
+        if self.name == "llamacpp":
+            # For llama.cpp, we use the native /completion endpoint with manual 
+            # templating. This is much more reliable than their OpenAI emulator 
+            # for strict models like Gemma.
             
-            # Fallback if no user message found (unlikely)
-            if not system_injected:
-                full_messages = [{"role": "system", "content": effective_system}] + messages
-        else:
-            full_messages = [{"role": "system", "content": effective_system}] + messages
-
+            # Start with BOS + System turn
+            prompt = f"<bos><start_of_turn>user\n{effective_system}\n\n"
+            
+            # Add history
+            for m in messages:
+                role = "user" if m["role"] == "user" else "model"
+                if m["role"] == "user" and m == messages[0]:
+                    # First user message follows system prompt in the same turn
+                    prompt += f"{m['content']}<end_of_turn>\n"
+                elif m["role"] == "user":
+                    prompt += f"<start_of_turn>user\n{m['content']}<end_of_turn>\n"
+                else:
+                    prompt += f"<start_of_turn>model\n{m['content']}<end_of_turn>\n"
+            
+            # Ready for assistant response
+            prompt += "<start_of_turn>model\n"
+            
+            return {
+                "prompt": prompt,
+                "stream": True,
+                "n_predict": 256,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "stop": ["<end_of_turn>", "<eos>", "</s>"],
+            }
+        
+        full_messages = [{"role": "system", "content": effective_system}] + messages
         return {
             "model": effective_model,
             "messages": full_messages,
